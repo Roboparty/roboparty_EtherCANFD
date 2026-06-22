@@ -1,0 +1,8 @@
+dependency:
+  - esc
+  - usb
+  - mcan
+
+excluded_targets:
+  - debug
+  - release

@@ -1,0 +1,10 @@
+device HPM5E31XGNX
+si JTAG
+JTAGConf -1,-1
+speed auto
+connect
+h
+loadfile @JLINK_ELF_PATH@
+r
+g
+exit

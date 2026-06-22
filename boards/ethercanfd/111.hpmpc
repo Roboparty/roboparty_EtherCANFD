@@ -1,0 +1,264 @@
+{
+  "clientKey": "db808145cd8392fb21e59955d93b6e28",
+  "secretKey": "5ab5f19ef285c6bfce81c9ecd40914b8",
+  "content": {
+    "pid": "e971f336-cd97-4cd4-843e-f165c6406384",
+    "info": {
+      "projectName": "111.hpmpc",
+      "sdkName": "1.11.0",
+      "socName": "HPM5E3Y",
+      "packageName": "BGA196",
+      "createTime": 1781232590903,
+      "updateTime": 1781317726921,
+      "vscodePid": "19c5a3e7-5a2d-4589-b56a-909faf58d04f"
+    },
+    "pinmux": {
+      "functions": {
+        "init_pins": {
+          "selectPins": {
+            "PA21": {
+              "signal": "ESC0.A.P0_RXCK",
+              "padCtls": {}
+            },
+            "PA16": {
+              "signal": "ESC0.A.P0_RXDV",
+              "padCtls": {}
+            },
+            "PA23": {
+              "signal": "ESC0.AB.P0_RXER",
+              "padCtls": {}
+            },
+            "PA24": {
+              "signal": "ESC0.A.P0_TXCK",
+              "padCtls": {}
+            },
+            "PA29": {
+              "signal": "ESC0.A.P0_TXEN",
+              "padCtls": {}
+            },
+            "PA17": {
+              "signal": "ESC0.A.P0_RXD[0]",
+              "padCtls": {}
+            },
+            "PA18": {
+              "signal": "ESC0.A.P0_RXD[1]",
+              "padCtls": {}
+            },
+            "PA19": {
+              "signal": "ESC0.A.P0_RXD[2]",
+              "padCtls": {}
+            },
+            "PA20": {
+              "signal": "ESC0.A.P0_RXD[3]",
+              "padCtls": {}
+            },
+            "PA25": {
+              "signal": "ESC0.A.P0_TXD[0]",
+              "padCtls": {}
+            },
+            "PA26": {
+              "signal": "ESC0.A.P0_TXD[1]",
+              "padCtls": {}
+            },
+            "PA27": {
+              "signal": "ESC0.A.P0_TXD[2]",
+              "padCtls": {}
+            },
+            "PA28": {
+              "signal": "ESC0.A.P0_TXD[3]",
+              "padCtls": {}
+            },
+            "PF13": {
+              "signal": "ESC0.A.P1_RXCK",
+              "padCtls": {}
+            },
+            "PF08": {
+              "signal": "ESC0.A.P1_RXDV",
+              "padCtls": {}
+            },
+            "PF14": {
+              "signal": "ESC0.A.P1_RXER",
+              "padCtls": {}
+            },
+            "PF02": {
+              "signal": "ESC0.A.P1_TXCK",
+              "padCtls": {}
+            },
+            "PF07": {
+              "signal": "ESC0.A.P1_TXEN",
+              "padCtls": {}
+            },
+            "PF09": {
+              "signal": "ESC0.A.P1_RXD[0]",
+              "padCtls": {}
+            },
+            "PF10": {
+              "signal": "ESC0.A.P1_RXD[1]",
+              "padCtls": {}
+            },
+            "PF11": {
+              "signal": "ESC0.A.P1_RXD[2]",
+              "padCtls": {}
+            },
+            "PF12": {
+              "signal": "ESC0.A.P1_RXD[3]",
+              "padCtls": {}
+            },
+            "PF03": {
+              "signal": "ESC0.A.P1_TXD[0]",
+              "padCtls": {}
+            },
+            "PF04": {
+              "signal": "ESC0.A.P1_TXD[1]",
+              "padCtls": {}
+            },
+            "PF05": {
+              "signal": "ESC0.A.P1_TXD[2]",
+              "padCtls": {}
+            },
+            "PF06": {
+              "signal": "ESC0.A.P1_TXD[3]",
+              "padCtls": {}
+            },
+            "PA31": {
+              "signal": "ESC0.A.MDC",
+              "padCtls": {}
+            },
+            "PD02": {
+              "signal": "ESC0.B.SCL",
+              "padCtls": {}
+            },
+            "PA30": {
+              "signal": "ESC0.A.MDIO",
+              "padCtls": {}
+            },
+            "PA09": {
+              "signal": "ESC0.A.REFCK",
+              "padCtls": {}
+            },
+            "PC11": {
+              "signal": "ESC0.F.CTR[2]",
+              "padCtls": {}
+            },
+            "PC16": {
+              "signal": "ESC0.F.CTR[7]",
+              "padCtls": {}
+            },
+            "PA06": {
+              "signal": "JTAG.A.TCK",
+              "padCtls": {}
+            },
+            "PA05": {
+              "signal": "JTAG.A.TDI",
+              "padCtls": {}
+            },
+            "PA04": {
+              "signal": "JTAG.A.TDO",
+              "padCtls": {}
+            },
+            "PA07": {
+              "signal": "JTAG.A.TMS",
+              "padCtls": {}
+            },
+            "PA08": {
+              "signal": "JTAG.A.TRST",
+              "padCtls": {}
+            },
+            "PD01": {
+              "signal": "MCAN0.D.RXD",
+              "padCtls": {}
+            },
+            "PD00": {
+              "signal": "MCAN0.D.TXD",
+              "padCtls": {}
+            },
+            "PD05": {
+              "signal": "MCAN1.D.TXD",
+              "padCtls": {}
+            },
+            "PD04": {
+              "signal": "MCAN1.D.RXD",
+              "padCtls": {}
+            },
+            "PC09": {
+              "signal": "MCAN2.C.RXD",
+              "padCtls": {}
+            },
+            "PC08": {
+              "signal": "MCAN2.C.TXD",
+              "padCtls": {}
+            },
+            "PC14": {
+              "signal": "MCAN3.C.RXD",
+              "padCtls": {}
+            },
+            "PC15": {
+              "signal": "MCAN3.C.TXD",
+              "padCtls": {}
+            },
+            "PC30": {
+              "signal": "SPI2.B.DAT2",
+              "padCtls": {}
+            },
+            "PC31": {
+              "signal": "SPI2.B.DAT3",
+              "padCtls": {}
+            },
+            "PC28": {
+              "signal": "SPI2.B.MISO",
+              "padCtls": {}
+            },
+            "PC29": {
+              "signal": "SPI2.B.MOSI",
+              "padCtls": {}
+            },
+            "PC26": {
+              "signal": "SPI2.B.SCLK",
+              "padCtls": {
+                "LOOP_BACK": "1"
+              }
+            },
+            "PC27": {
+              "signal": "SPI2.B.CS[0]",
+              "padCtls": {}
+            },
+            "PC25": {
+              "signal": "SPI2.B.CS[1]",
+              "padCtls": {}
+            },
+            "PC24": {
+              "signal": "SPI2.B.CS[2]",
+              "padCtls": {}
+            },
+            "PC19": {
+              "signal": "SPI2.B.CS[3]",
+              "padCtls": {}
+            }
+          }
+        }
+      },
+      "sorter": []
+    },
+    "clock": {
+      "functions": {
+        "init_clocks": {
+          "selectClocks": {
+            "srcClocks": [
+              "osc32k",
+              "osc24m",
+              "clk0_pll0",
+              "clk1_pll0",
+              "clk0_pll1",
+              "clk1_pll1",
+              "clk2_pll1",
+              "clk0_pll2",
+              "clk1_pll2"
+            ],
+            "funcClocks": []
+          },
+          "enableClocks": {}
+        }
+      }
+    }
+  }
+}

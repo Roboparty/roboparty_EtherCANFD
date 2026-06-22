@@ -1,0 +1,3 @@
+#pragma once
+#define FIRMWARE_VERSION "${FIRMWARE_VERSION}"
+#define BUILD_DATE "${BUILD_DATE}"

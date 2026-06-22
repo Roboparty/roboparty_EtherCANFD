@@ -1,0 +1,8 @@
+device HPM5E31XPBX
+si JTAG
+JTAGConf -1,-1
+speed auto
+connect
+h
+verifybin @JLINK_BIN_PATH@,0x80000000
+exit

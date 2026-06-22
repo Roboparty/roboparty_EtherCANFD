@@ -1,0 +1,66 @@
+name: Build & Release
+
+on:
+  # push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # runs-on: windows-latest
+    runs-on: ['self-hosted', 'n100']
+
+    steps:
+      - name: Checkout firmware source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - name: Cache SDK environment
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: C:\sdk_env
+          key: sdk-env-${{ runner.os }}-${{ github.run_month }}
+
+      - name: Clone SDK environment
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyyaml jinja2
+
+      - name: Set environment
+        shell: pwsh
+        run: |
+          "HPM_SDK_BASE=C:\sdk_env\hpm_sdk" >> $env:GITHUB_ENV
+          "C:\sdk_env\tools\cmake\bin" >> $env:GITHUB_PATH
+          "C:\sdk_env\tools\ninja" >> $env:GITHUB_PATH
+
+      - name: Configure CMake
+        run: |
+          cmake -G "Ninja" -DBOARD=ethercanfd -B build
+
+      - name: Build firmware
+        run: |
+          ninja -C build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ethercanfd-firmware
+          path: |
+            build/output/ethercanfd.bin
+            build/output/ethercanfd_v*.bin
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/output/ethercanfd.bin
+            build/output/ethercanfd_v*.bin
+          name: ${{ github.ref_name }}
+          generate_release_notes: true

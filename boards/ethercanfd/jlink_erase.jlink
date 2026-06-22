@@ -1,0 +1,14 @@
+device HPM5E31XPBX
+si JTAG
+JTAGConf -1,-1
+speed auto
+connect
+r
+h
+sleep 100
+w4 0x40000004 1
+w4 0x8008FFF0 0 
+r
+g
+erase
+exit
