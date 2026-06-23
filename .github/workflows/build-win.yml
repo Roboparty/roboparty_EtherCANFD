@@ -23,6 +23,7 @@ jobs:
       - name: Clone SDK environment
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
+          if (Test-Path C:\sdk_env) { Remove-Item -Recurse -Force C:\sdk_env }
           git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
 
       - name: Install Python dependencies
