@@ -5,7 +5,7 @@
 # ================= 配置区域 =================
 SKIP_INIT=true      # true=跳过接口初始化和配置, 使用现有状态
 # INTERFACES=("can0" "can1" "can2" "can3")
-INTERFACES=("can0")
+INTERFACES=("can4")
 # INTERFACES=("can4" "can5" "can6" "can7")
 BITRATE=1000000
 DBITRATE=5000000
@@ -26,7 +26,7 @@ MIT_HZ=750          # MIT 发送频率 (Hz)
 MOTOR_ZERO_DATA="00007FFF07FF07FF"
 
 ENABLE_RESCUE=false
-PARSE_ERROR=0        # 0=不解析电机错误反馈, 1=启动 candump 解析
+PARSE_ERROR=1        # 0=不解析电机错误反馈, 1=启动 candump 解析
 # [SET] 日志文件路径
 RESCUE_LOG="can_rescue_mit.log"
 ERROR_LOG="/tmp/lro_error_$$.log"
@@ -40,6 +40,8 @@ declare -A LRO_ERR_MAP=(
     [06]="BRAKE_OVERVOLT"
     [07]="DRV_ERROR"
 )
+declare -A LRO_ERR_LAST
+declare -A LRO_ERR_LAST_TS
 # ============================================
 
 if [ "$EUID" -ne 0 ]; then
@@ -135,8 +137,8 @@ stop_error_monitor() {
 }
 
 parse_error_summary() {
-    declare -gA LRO_ERR_LAST
-    declare -gA LRO_ERR_LAST_TS
+    LRO_ERR_LAST=()
+    LRO_ERR_LAST_TS=()
     while IFS='|' read -r ts iface motor err_code err_name data; do
         LRO_ERR_LAST["$iface:$motor"]="$err_name(0x$(printf '%02X' ${err_code:-0}))"
         LRO_ERR_LAST_TS["$iface:$motor"]="$ts"
@@ -216,10 +218,10 @@ while true; do
     if [[ $PARSE_ERROR -eq 1 ]]; then
     echo "  电机错误反馈:"
     parse_error_summary
-    local err_count=0
+    err_count=0
     for IF in "${INTERFACES[@]}"; do
         for ((m=1; m<=NUM_MOTORS; m++)); do
-            local key="$IF:motor_$m"
+            key="$IF:motor_$m"
             if [[ -n "${LRO_ERR_LAST[$key]:-}" ]]; then
                 printf "    \033[31m[%s motor_%d] %s\033[0m (ts %s)\n" \
                     "$IF" "$m" "${LRO_ERR_LAST[$key]}" "${LRO_ERR_LAST_TS[$key]}"
@@ -228,7 +230,7 @@ while true; do
         done
     done
     if [[ $err_count -eq 0 ]]; then
-        echo "    \033[32m全部正常\033[0m"
+        echo -e "    \033[32m全部正常\033[0m"
     fi
     fi
     echo "------------------------------------------------------------------------------------------"
