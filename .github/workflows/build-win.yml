@@ -35,8 +35,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          $env:PATH = "C:\Users\Administrator\scoop\shims;$env:PATH"
-          python -m pip install pyyaml jinja2
+          python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pyyaml jinja2
 
       - name: Configure CMake
         run: |
