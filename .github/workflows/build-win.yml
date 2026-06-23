@@ -33,10 +33,6 @@ jobs:
           "C:\sdk_env\tools\ninja" >> $env:GITHUB_PATH
           "C:\sdk_env\tools\python3" >> $env:GITHUB_PATH
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --proxy "" --trusted-host pypi.org --trusted-host files.pythonhosted.org pyyaml jinja2
-
       - name: Configure CMake
         run: |
           cmake -G "Ninja" -DBOARD=ethercanfd -B build
