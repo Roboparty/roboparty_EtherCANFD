@@ -27,7 +27,6 @@ jobs:
           git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
 
       - name: Set environment
-        shell: pwsh
         run: |
           "HPM_SDK_BASE=C:\sdk_env\hpm_sdk" >> $env:GITHUB_ENV
           "C:\sdk_env\tools\cmake\bin" >> $env:GITHUB_PATH
