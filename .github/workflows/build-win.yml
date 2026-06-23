@@ -29,6 +29,7 @@ jobs:
       - name: Set environment
         run: |
           "HPM_SDK_BASE=C:\sdk_env\hpm_sdk" >> $env:GITHUB_ENV
+          "SSC_TOOL_DIR=C:\Program Files (x86)\Beckhoff\EtherCAT Slave Stack Code Tool" >> $env:GITHUB_ENV
           "C:\sdk_env\tools\cmake\bin" >> $env:GITHUB_PATH
           "C:\sdk_env\tools\ninja" >> $env:GITHUB_PATH
           "C:\sdk_env\tools\python3" >> $env:GITHUB_PATH
