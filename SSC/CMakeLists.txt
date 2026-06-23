@@ -12,23 +12,28 @@ set(SSC_GEN_STAMP "${CMAKE_CURRENT_BINARY_DIR}/ssc_gen.stamp")
 if(NOT EXISTS "${SSC_GEN_STAMP}"
    OR "${SSC_ESP}" IS_NEWER_THAN "${SSC_GEN_STAMP}"
    OR "${SSC_XLSX}" IS_NEWER_THAN "${SSC_GEN_STAMP}")
-    message(STATUS "SSC generation: ${SSC_ESP} -> Src/")
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E remove_directory "${SSC_GEN_TMP}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${SSC_GEN_TMP}"
-    )
-    execute_process(
-        COMMAND "${SSC_TOOL_CMD}" -o "${SSC_GEN_TMP}" -p "${SSC_ESP}"
-        RESULT_VARIABLE _ssc_res
-    )
-    if(NOT _ssc_res EQUAL 0)
-        message(FATAL_ERROR "SSC generation failed (exit ${_ssc_res})")
+    if(EXISTS "${SSC_TOOL_CMD}")
+        message(STATUS "SSC generation: ${SSC_ESP} -> Src/")
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E remove_directory "${SSC_GEN_TMP}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${SSC_GEN_TMP}"
+        )
+        execute_process(
+            COMMAND "${SSC_TOOL_CMD}" -o "${SSC_GEN_TMP}" -p "${SSC_ESP}"
+            RESULT_VARIABLE _ssc_res
+        )
+        if(NOT _ssc_res EQUAL 0)
+            message(FATAL_ERROR "SSC generation failed (exit ${_ssc_res})")
+        endif()
+        file(REMOVE_RECURSE "${CMAKE_CURRENT_SOURCE_DIR}/Src")
+        file(COPY "${SSC_GEN_TMP}/src/" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/Src")
+        file(COPY "${SSC_GEN_TMP}/EtherCANFD.xml" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/")
+        file(REMOVE_RECURSE "${SSC_GEN_TMP}")
+        file(TOUCH "${SSC_GEN_STAMP}")
+    else()
+        message(STATUS "SSC tool not found, using pre-generated Src/")
+        file(TOUCH "${SSC_GEN_STAMP}")
     endif()
-    file(REMOVE_RECURSE "${CMAKE_CURRENT_SOURCE_DIR}/Src")
-    file(COPY "${SSC_GEN_TMP}/src/" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/Src")
-    file(COPY "${SSC_GEN_TMP}/EtherCANFD.xml" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/")
-    file(REMOVE_RECURSE "${SSC_GEN_TMP}")
-    file(TOUCH "${SSC_GEN_STAMP}")
 endif()
 
 set(SSC_GEN_SOURCES
