@@ -1384,6 +1384,9 @@ void gs_usb_run(void)
     gs_usb_init();
     printf("[GS_USB] init: gs_usb_init() returned\r\n");
 
+    /* 禁用 Suspend 中断：D+上拉后总线空闲>3ms会反复触发SLI形成死循环 */
+    ((USB_Type *)HPM_USB0)->USBINTR &= ~USB_USBINTR_SLE_MASK;
+
     /* 强制绑定 USB0 IRQ 到 CherryUSB ISR 入口，排除向量未正确链接的问题 */
     install_isr(CONFIG_HPM_USBD_IRQn, (uint32_t)hpm_isr_usb0);
     intc_m_enable_irq_with_priority(CONFIG_HPM_USBD_IRQn, 3);

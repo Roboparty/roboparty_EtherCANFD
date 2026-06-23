@@ -26,7 +26,7 @@ int main(void)
     for (int ch = 0; ch < 4; ch++) board_led_can_on(ch);
     board_led_usb_on();
     board_led_mode_on();
-    for (volatile uint32_t d = 0; d < 200000000U; d++) { __asm__("nop"); }
+    for (volatile uint32_t d = 0; d < 100000000U; d++) { __asm__("nop"); }
     for (int ch = 0; ch < 4; ch++) board_led_can_off(ch);
     board_led_usb_off();
     board_led_mode_off();
