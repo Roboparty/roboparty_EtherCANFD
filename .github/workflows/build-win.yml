@@ -35,7 +35,8 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          & "C:\Users\Administrator\scoop\shims\python.exe" -m pip install pyyaml jinja2
+          $env:PATH = "C:\Users\Administrator\scoop\shims;$env:PATH"
+          python -m pip install pyyaml jinja2
 
       - name: Configure CMake
         run: |
