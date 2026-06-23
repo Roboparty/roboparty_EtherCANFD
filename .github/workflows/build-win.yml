@@ -35,8 +35,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          $env:HTTP_PROXY = ""; $env:HTTPS_PROXY = ""; $env:http_proxy = ""; $env:https_proxy = ""
-          python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org pyyaml jinja2
+          python -m pip install --proxy "" --trusted-host pypi.org --trusted-host files.pythonhosted.org pyyaml jinja2
 
       - name: Configure CMake
         run: |
