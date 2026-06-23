@@ -26,16 +26,17 @@ jobs:
           if (Test-Path C:\sdk_env) { Remove-Item -Recurse -Force C:\sdk_env }
           git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install pyyaml jinja2
-
       - name: Set environment
         shell: pwsh
         run: |
           "HPM_SDK_BASE=C:\sdk_env\hpm_sdk" >> $env:GITHUB_ENV
           "C:\sdk_env\tools\cmake\bin" >> $env:GITHUB_PATH
           "C:\sdk_env\tools\ninja" >> $env:GITHUB_PATH
+          "C:\sdk_env\tools\python3" >> $env:GITHUB_PATH
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install pyyaml jinja2
 
       - name: Configure CMake
         run: |
