@@ -12,9 +12,6 @@ jobs:
     steps:
       - name: Checkout firmware source
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          token: ${{ secrets.GH_PAT || github.token }}
 
       - name: Cache SDK environment
         id: cache-sdk
