@@ -63,8 +63,6 @@ void init_adc_bldc_pins(void);
 void init_adc_qeiv2_pins(void);
 void init_mcan1_transceiver_phy_pin(void);
 void init_led_pins(void);
-void init_led_pins_alt(void);
-void init_board_detect_pin(void);
 void init_led_pins_as_gpio(void);
 void init_led_pins_as_pwm(void);
 void init_plb_ab_pins(void);

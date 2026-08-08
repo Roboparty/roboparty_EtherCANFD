@@ -334,98 +334,43 @@ void board_write_spi_cs(uint32_t pin, uint8_t state)
 }
 
 static const uint8_t s_led_can_pins[4]     = {BOARD_LED_CAN0_PIN, BOARD_LED_CAN1_PIN, BOARD_LED_CAN2_PIN, BOARD_LED_CAN3_PIN};
-static const uint8_t s_led_can_pins_alt[4] = {BOARD_LED_ALT_CAN0_PIN, BOARD_LED_ALT_CAN1_PIN, BOARD_LED_ALT_CAN2_PIN, BOARD_LED_ALT_CAN3_PIN};
-static bool g_led_is_alt;
 
-bool board_detect_led_pinout(void)
-{
-    uint16_t result;
-
-    init_board_detect_pin();
-
-    clock_add_to_group(clock_adc0, 0);
-    clock_set_adc_source(clock_adc0, clk_adc_src_ahb0);
-
-    adc16_config_t cfg;
-    adc16_get_default_config(&cfg);
-    cfg.res         = adc16_res_16_bits;
-    cfg.conv_mode   = adc16_conv_mode_oneshot;
-    cfg.adc_clk_div = adc16_clock_divider_4;
-    cfg.sel_sync_ahb = true;
-    adc16_init(HPM_ADC0, &cfg);
-
-    adc16_channel_config_t ch_cfg;
-    adc16_get_channel_default_config(&ch_cfg);
-    ch_cfg.ch           = 0;
-    ch_cfg.sample_cycle = 20;
-    adc16_init_channel(HPM_ADC0, &ch_cfg);
-    adc16_set_nonblocking_read(HPM_ADC0);
-
-    if (adc16_get_oneshot_result(HPM_ADC0, 0, &result) != status_success) {
-        result = 0xFFFF;
-    }
-
-    uint32_t voltage_mv = ((uint32_t)result * 3300U) / 65535U;
-
-    g_led_is_alt = (voltage_mv < BOARD_DETECT_ADC_THRESHOLD_MV);
-
-    printf("[BOARD] LED detect ADC=0x%04x (%lumV) -> %s pins\n",
-           (unsigned)result, (unsigned long)voltage_mv,
-           g_led_is_alt ? "PB26-31" : "PF02-07");
-
-    return g_led_is_alt;
-}
 
 static uint32_t led_port(void)
 {
-    return g_led_is_alt ? BOARD_LED_ALT_GPIO_PORT : BOARD_LED_GPIO_PORT;
+    return BOARD_LED_GPIO_PORT;
 }
 
 static uint32_t led_can_port(void)
 {
-#if BOARD_LED_CAN_PA
-    return g_led_is_alt ? BOARD_LED_ALT_GPIO_PORT : BOARD_LED_CAN_GPIO_PORT;
-#else
-    return led_port();
-#endif
+    return BOARD_LED_CAN_GPIO_PORT;
 }
 
 static uint8_t led_can_pin(uint8_t ch)
 {
-    return g_led_is_alt ? s_led_can_pins_alt[ch] : s_led_can_pins[ch];
+    return s_led_can_pins[ch];
 }
 
 static uint8_t led_usb_pin(void)
 {
-    return g_led_is_alt ? BOARD_LED_ALT_USB_PIN : BOARD_LED_USB_PIN;
+    return BOARD_LED_USB_PIN;
 }
 
 static uint8_t led_mode_pin(void)
 {
-    return g_led_is_alt ? BOARD_LED_ALT_MODE_PIN : BOARD_LED_MODE_PIN;
+    return BOARD_LED_MODE_PIN;
 }
 
 void board_init_status_leds(void)
 {
-    if (g_led_is_alt) {
-        init_led_pins_alt();
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_ALT_GPIO_PORT, BOARD_LED_ALT_CAN0_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_ALT_GPIO_PORT, BOARD_LED_ALT_CAN1_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_ALT_GPIO_PORT, BOARD_LED_ALT_CAN2_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_ALT_GPIO_PORT, BOARD_LED_ALT_CAN3_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_ALT_GPIO_PORT, BOARD_LED_ALT_USB_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_ALT_GPIO_PORT, BOARD_LED_ALT_MODE_PIN, BOARD_LED_OFF_LEVEL);
-        printf("[BOARD] LED pins: PB26-31 (alt)\n");
-    } else {
-        init_led_pins();
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN0_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN1_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN2_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN3_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_GPIO_PORT, BOARD_LED_USB_PIN, BOARD_LED_OFF_LEVEL);
-        gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_GPIO_PORT, BOARD_LED_MODE_PIN, BOARD_LED_OFF_LEVEL);
-        printf("[BOARD] LED pins: CAN=PA17-20 USB/MODE=PF06-07 (default)\n");
-    }
+    init_led_pins();
+    gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN0_PIN, BOARD_LED_OFF_LEVEL);
+    gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN1_PIN, BOARD_LED_OFF_LEVEL);
+    gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN2_PIN, BOARD_LED_OFF_LEVEL);
+    gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_CAN_GPIO_PORT, BOARD_LED_CAN3_PIN, BOARD_LED_OFF_LEVEL);
+    gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_GPIO_PORT, BOARD_LED_USB_PIN, BOARD_LED_OFF_LEVEL);
+    gpio_set_pin_output_with_initial(BOARD_LED_GPIO_CTRL, BOARD_LED_GPIO_PORT, BOARD_LED_MODE_PIN, BOARD_LED_OFF_LEVEL);
+    printf("[BOARD] LED pins: PF02-07\n");
 }
 
 void board_led_can_on(uint8_t ch)

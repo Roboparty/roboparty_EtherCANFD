@@ -277,40 +277,20 @@
 #define BOARD_CALLBACK_TIMER_IRQ      IRQn_GPTMR3
 #define BOARD_CALLBACK_TIMER_CLK_NAME (clock_gptmr3)
 
-/* Status LEDs: default PF02-PF07, alt PB26-PB31 detected via ADC */
+/* Status LEDs: PF02-07 */
 #define BOARD_LED_GPIO_CTRL  HPM_GPIO0
 #define BOARD_LED_OFF_LEVEL  0
 #define BOARD_LED_ON_LEVEL   1
 
-#define BOARD_LED_CAN_PA    1   /* 1=PA17-20, 0=PF02-05 */
-
-#if BOARD_LED_CAN_PA
-#define BOARD_LED_CAN0_PIN   17
-#define BOARD_LED_CAN1_PIN   18
-#define BOARD_LED_CAN2_PIN   19
-#define BOARD_LED_CAN3_PIN   20
-#define BOARD_LED_CAN_GPIO_PORT  GPIO_DI_GPIOA
-#else
 #define BOARD_LED_CAN0_PIN   2
 #define BOARD_LED_CAN1_PIN   3
 #define BOARD_LED_CAN2_PIN   4
 #define BOARD_LED_CAN3_PIN   5
 #define BOARD_LED_CAN_GPIO_PORT  GPIO_DI_GPIOF
-#endif
 
 #define BOARD_LED_USB_PIN    6
 #define BOARD_LED_MODE_PIN   7
 #define BOARD_LED_GPIO_PORT  GPIO_DI_GPIOF
-
-#define BOARD_LED_ALT_CAN0_PIN   26
-#define BOARD_LED_ALT_CAN1_PIN   27
-#define BOARD_LED_ALT_CAN2_PIN   28
-#define BOARD_LED_ALT_CAN3_PIN   29
-#define BOARD_LED_ALT_USB_PIN    30
-#define BOARD_LED_ALT_MODE_PIN   31
-#define BOARD_LED_ALT_GPIO_PORT  GPIO_DI_GPIOB
-
-#define BOARD_DETECT_ADC_THRESHOLD_MV 1200
 
 #ifndef BOARD_SHOW_CLOCK
 #define BOARD_SHOW_CLOCK 1
@@ -710,7 +690,6 @@ void board_init_spi_pins(SPI_Type *ptr);
 void board_init_spi_pins_with_gpio_as_cs(SPI_Type *ptr);
 void board_write_spi_cs(uint32_t pin, uint8_t state);
 uint8_t board_get_led_gpio_off_level(void);
-bool board_detect_led_pinout(void);
 void board_init_status_leds(void);
 void board_led_can_on(uint8_t ch);
 void board_led_can_off(uint8_t ch);

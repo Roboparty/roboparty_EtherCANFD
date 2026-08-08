@@ -640,28 +640,15 @@ static void gs_usb_dump_mem_layout(void)
 static void gs_usb_dump_hw_regs(const char *tag)
 {
     USB_Type *usb = (USB_Type *)HPM_USB0;
-    uint32_t cmd = usb->USBCMD;
-    uint32_t sts = usb->USBSTS;
-    uint32_t intr = usb->USBINTR;
-    uint32_t mode = usb->USBMODE;
-    uint32_t port = usb->PORTSC1;
-
-    printf("[GS_USB][%s] USBCMD=0x%08lx [RS=%lu RST=%lu] "
-           "USBSTS=0x%08lx [UI=%lu SRI=%lu HCH=%lu] "
-           "USBINTR=0x%08lx USBMODE=0x%08lx\r\n",
+    printf("[GS_USB][%s] USBCMD=0x%08lx USBSTS=0x%08lx USBINTR=0x%08lx USBMODE=0x%08lx\r\n",
         tag,
-        (unsigned long)cmd, (cmd >> 0) & 1UL, (cmd >> 1) & 1UL,
-        (unsigned long)sts, (sts >> 0) & 1UL, (sts >> 7) & 1UL, (sts >> 12) & 1UL,
-        (unsigned long)intr,
-        (unsigned long)mode);
-    printf("[GS_USB][%s] PORTSC1=0x%08lx [CCS=%lu PE=%lu SUSP=%lu PR=%lu] "
-           "OTG_CTRL0=0x%08lx PHY_STATUS=0x%08lx\r\n",
+        (unsigned long)usb->USBCMD,
+        (unsigned long)usb->USBSTS,
+        (unsigned long)usb->USBINTR,
+        (unsigned long)usb->USBMODE);
+    printf("[GS_USB][%s] PORTSC1=0x%08lx OTG_CTRL0=0x%08lx PHY_STATUS=0x%08lx\r\n",
         tag,
-        (unsigned long)port,
-        (port >> 0) & 1UL,  /* CCS: Current Connect Status */
-        (port >> 1) & 1UL,  /* PE:  Port Enable */
-        (port >> 8) & 1UL,  /* SUSP: Suspend */
-        (port >> 12) & 1UL, /* PR:  Port Reset */
+        (unsigned long)usb->PORTSC1,
         (unsigned long)usb->OTG_CTRL0,
         (unsigned long)usb->PHY_STATUS);
 }
@@ -1393,38 +1380,6 @@ void gs_usb_run(void)
     gs_usb_dump_mem_layout();
     gs_usb_dump_hw_regs("boot");
     printf("==========================================\r\n");
-
-    /*
-     * 冷启动修复：board_init_usb 配置了 60MHz USB 时钟和内部 VBUS 后，
-     * USB 控制器状态机处于 power-on 不定态。必须通过 USBCMD.RST=1 将其
-     * 复位到确定初始态，否则 usbd_initialize 设 RS=1 时 D+ 上拉可能不干净，
-     * 主机收不到合法连接事件 → 无法枚举。
-     * 手动复位 MCU 可以工作是因为全局复位间接复位了 USB 控制器。
-     *
-     * EHCI 规范要求 RST 之前必须确保 RS=0（冷启时 RS 默认为 0，满足条件）。
-     */
-    {
-        USB_Type *usb = (USB_Type *)HPM_USB0;
-
-        /* 等待 PHY / 内部 VBUS 通路稳定（模拟电路需要建立时间） */
-        board_delay_ms(50);
-
-        /* USBCMD.RST = 1：复位管道、定时器、计数器、状态机 */
-        usb->USBCMD |= (1UL << 1);
-        board_delay_ms(1);
-        /* 等待硬件自动清零 RST（EHCI 规定最多 ~1ms） */
-        {
-            volatile uint32_t timeout = 50000U;
-            while ((usb->USBCMD & (1UL << 1)) && --timeout) {
-                __asm__("nop");
-            }
-            if (timeout == 0U) {
-                printf("[GS_USB] WARNING: USBCMD.RST did not clear!\r\n");
-            }
-        }
-
-        gs_usb_dump_hw_regs("after_rst");
-    }
 
     gs_usb_init();
     printf("[GS_USB] init: gs_usb_init() returned\r\n");
