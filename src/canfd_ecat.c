@@ -275,11 +275,10 @@ static void cancel_all_hw_tx_buffers(uint8_t ch)
 static uint64_t get_time_us(void)
 {
     uint64_t cycles = hpm_csr_get_core_mcycle();
-    uint32_t cpu_hz = clock_get_frequency(clock_cpu0);
-    if (cpu_hz == 0U) {
+    if (hpm_core_clock == 0U) {
         return 0;
     }
-    return (cycles * 1000000ULL) / cpu_hz;
+    return (cycles * 1000000ULL) / hpm_core_clock;
 }
 
 static void print_tx_pending_diag(uint8_t ch, const char *tag)

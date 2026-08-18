@@ -13,6 +13,7 @@
 #include "hpm_sysctl_drv.h"
 #include "hpm_mcan_drv.h"
 #include "hpm_clock_drv.h"
+#include "hpm_ewdg_drv.h"
 #include "hpm_interrupt.h"
 #include "hpm_usb_regs.h"
 #include "usbd_core.h"
@@ -154,7 +155,7 @@ USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX struct gs_device_config dev_config;
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX struct gs_device_bt_const bt_const;
 
 /* USB descriptors (advanced callback mode, explicit byte layout for EP0 diagnostics) */
-#define USB_NOCACHE_RAM_INIT_SECTION __attribute__((section(".noncacheable.init")))
+#define USB_NOCACHE_RAM_INIT_SECTION __attribute__((section(".rodata")))
 
 #ifndef FW_BCD_DEVICE
 #define FW_BCD_DEVICE 0x0100
@@ -413,15 +414,14 @@ static bool enqueue_in_msg(const void *data, uint32_t len)
 
 static uint64_t gs_usb_get_time_us(void)
 {
-    uint32_t cpu_hz = clock_get_frequency(clock_cpu0);
     uint64_t cycles;
 
-    if (cpu_hz == 0U) {
+    if (hpm_core_clock == 0U) {
         return 0U;
     }
 
     cycles = hpm_csr_get_core_mcycle();
-    return (cycles * 1000000ULL) / cpu_hz;
+    return (cycles * 1000000ULL) / hpm_core_clock;
 }
 
 static bool tx_ring_push(uint8_t ch, const struct tx_ring_item *item)
@@ -630,6 +630,11 @@ static void gs_usb_dump_mem_layout(void)
     printf("[GS_USB] dev desc @0x%08lx (noncache=%d)\r\n",
         (unsigned long)(uintptr_t)gs_usb_device_descriptor,
         is_in_noncache_region(gs_usb_device_descriptor, sizeof(gs_usb_device_descriptor)) ? 1 : 0);
+    printf("[GS_USB] dev desc bytes:");
+    for (uint32_t i = 0; i < 18; i++) {
+        printf(" %02x", gs_usb_device_descriptor[i]);
+    }
+    printf("\r\n");
     printf("[GS_USB] ep_out @0x%08lx (noncache=%d) ep_in @0x%08lx (noncache=%d)\r\n",
         (unsigned long)(uintptr_t)ep_out_buffer,
         is_in_noncache_region(ep_out_buffer, sizeof(ep_out_buffer)) ? 1 : 0,
@@ -1347,6 +1352,21 @@ void gs_usb_init(void)
     gs_usb_dump_hw_regs("post_init");
 }
 
+static void gs_usb_watchdog_init(void)
+{
+    clock_add_to_group(clock_watchdog0, BOARD_RUNNING_CORE);
+    ewdg_config_t config;
+    ewdg_get_default_config(HPM_EWDG0, &config);
+    config.enable_watchdog = true;
+    config.int_rst_config.enable_timeout_reset = true;      /* timeout reset */
+    config.ctrl_config.use_lowlevel_timeout = false;
+    config.ctrl_config.keep_running_in_debug_mode = false;  /* pause in debug, no reset */
+    config.ctrl_config.cnt_clk_sel = ewdg_cnt_clk_src_bus_clk; /* AHB0, no 32K xtal */
+    config.cnt_src_freq = clock_get_frequency(clock_watchdog0);
+    config.ctrl_config.timeout_reset_us = 1000UL * 1000UL;  /* 1s */
+    ewdg_init(HPM_EWDG0, &config);
+}
+
 void gs_usb_run(void)
 {
     // 初始化 USB PHY和时钟，配置运行在高速模式
@@ -1381,6 +1401,38 @@ void gs_usb_run(void)
     gs_usb_dump_hw_regs("boot");
     printf("==========================================\r\n");
 
+    // /*
+    //  * 冷启动修复：board_init_usb 配置了 60MHz USB 时钟和内部 VBUS 后，
+    //  * USB 控制器状态机处于 power-on 不定态。必须通过 USBCMD.RST=1 将其
+    //  * 复位到确定初始态，否则 usbd_initialize 设 RS=1 时 D+ 上拉可能不干净，
+    //  * 主机收不到合法连接事件 → 无法枚举。
+    //  * 手动复位 MCU 可以工作是因为全局复位间接复位了 USB 控制器。
+    //  *
+    //  * EHCI 规范要求 RST 之前必须确保 RS=0（冷启时 RS 默认为 0，满足条件）。
+    //  */
+    // {
+    //     USB_Type *usb = (USB_Type *)HPM_USB0;
+
+    //     /* 等待 PHY / 内部 VBUS 通路稳定（模拟电路需要建立时间） */
+    //     board_delay_ms(50);
+
+    //     /* USBCMD.RST = 1：复位管道、定时器、计数器、状态机 */
+    //     usb->USBCMD |= (1UL << 1);
+    //     board_delay_ms(1);
+    //     /* 等待硬件自动清零 RST（EHCI 规定最多 ~1ms） */
+    //     {
+    //         volatile uint32_t timeout = 50000U;
+    //         while ((usb->USBCMD & (1UL << 1)) && --timeout) {
+    //             __asm__("nop");
+    //         }
+    //         if (timeout == 0U) {
+    //             printf("[GS_USB] WARNING: USBCMD.RST did not clear!\r\n");
+    //         }
+    //     }
+
+    //     gs_usb_dump_hw_regs("after_rst");
+    // }
+
     gs_usb_init();
     printf("[GS_USB] init: gs_usb_init() returned\r\n");
 
@@ -1409,7 +1461,10 @@ void gs_usb_run(void)
     uint32_t last_suspend_count = 0;
     uint32_t last_resume_count = 0;
 
+    gs_usb_watchdog_init();
+
     while (1) {
+        ewdg_refresh(HPM_EWDG0);
         USB_Type *usb = (USB_Type *)HPM_USB0;
         if (usb->USBSTS & USB_USBSTS_UI_MASK) {
             USBD_IRQHandler(0);
