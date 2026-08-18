@@ -624,18 +624,13 @@ static void gs_usb_dump_mem_layout(void)
 {
     extern uint32_t __noncacheable_start__[];
     extern uint32_t __noncacheable_end__[];
-    printf("[GS_USB] noncache: [0x%08lx, 0x%08lx)\r\n",
+    GS_USB_LOG("[GS_USB] noncache: [0x%08lx, 0x%08lx)\r\n",
         (unsigned long)(uintptr_t)__noncacheable_start__,
         (unsigned long)(uintptr_t)__noncacheable_end__);
-    printf("[GS_USB] dev desc @0x%08lx (noncache=%d)\r\n",
+    GS_USB_LOG("[GS_USB] dev desc @0x%08lx (noncache=%d)\r\n",
         (unsigned long)(uintptr_t)gs_usb_device_descriptor,
         is_in_noncache_region(gs_usb_device_descriptor, sizeof(gs_usb_device_descriptor)) ? 1 : 0);
-    printf("[GS_USB] dev desc bytes:");
-    for (uint32_t i = 0; i < 18; i++) {
-        printf(" %02x", gs_usb_device_descriptor[i]);
-    }
-    printf("\r\n");
-    printf("[GS_USB] ep_out @0x%08lx (noncache=%d) ep_in @0x%08lx (noncache=%d)\r\n",
+    GS_USB_LOG("[GS_USB] ep_out @0x%08lx (noncache=%d) ep_in @0x%08lx (noncache=%d)\r\n",
         (unsigned long)(uintptr_t)ep_out_buffer,
         is_in_noncache_region(ep_out_buffer, sizeof(ep_out_buffer)) ? 1 : 0,
         (unsigned long)(uintptr_t)ep_in_buffer,
@@ -645,13 +640,13 @@ static void gs_usb_dump_mem_layout(void)
 static void gs_usb_dump_hw_regs(const char *tag)
 {
     USB_Type *usb = (USB_Type *)HPM_USB0;
-    printf("[GS_USB][%s] USBCMD=0x%08lx USBSTS=0x%08lx USBINTR=0x%08lx USBMODE=0x%08lx\r\n",
+    GS_USB_LOG("[GS_USB][%s] USBCMD=0x%08lx USBSTS=0x%08lx USBINTR=0x%08lx USBMODE=0x%08lx\r\n",
         tag,
         (unsigned long)usb->USBCMD,
         (unsigned long)usb->USBSTS,
         (unsigned long)usb->USBINTR,
         (unsigned long)usb->USBMODE);
-    printf("[GS_USB][%s] PORTSC1=0x%08lx OTG_CTRL0=0x%08lx PHY_STATUS=0x%08lx\r\n",
+    GS_USB_LOG("[GS_USB][%s] PORTSC1=0x%08lx OTG_CTRL0=0x%08lx PHY_STATUS=0x%08lx\r\n",
         tag,
         (unsigned long)usb->PORTSC1,
         (unsigned long)usb->OTG_CTRL0,
@@ -1393,9 +1388,9 @@ void gs_usb_run(void)
     printf("[GS_USB] mcan_channels[0] base: 0x%08lX\r\n", (uint32_t)HPM_MCAN0);
 
     printf("[GS_USB] Firmware Started! Initializing USB...\r\n");
-    printf("[GS_USB] USB0 clock: %lu Hz\r\n", clock_get_frequency(clock_usb0));
-    printf("[GS_USB] mchtmr0 clock (from osc24m path): %lu Hz\r\n", clock_get_frequency(clock_mchtmr0));
-    printf("[GS_USB] IRQ: %d, EP0 MPS: %d, HS bulk MPS: %d\r\n",
+    GS_USB_LOG("[GS_USB] USB0 clock: %lu Hz\r\n", clock_get_frequency(clock_usb0));
+    GS_USB_LOG("[GS_USB] mchtmr0 clock (from osc24m path): %lu Hz\r\n", clock_get_frequency(clock_mchtmr0));
+    GS_USB_LOG("[GS_USB] IRQ: %d, EP0 MPS: %d, HS bulk MPS: %d\r\n",
            CONFIG_HPM_USBD_IRQn, 64, GS_USB_MAX_PACKET_SIZE);
     gs_usb_dump_mem_layout();
     gs_usb_dump_hw_regs("boot");
@@ -1472,27 +1467,27 @@ void gs_usb_run(void)
 
         if (last_connected_count != gs_usb_connected_count) {
             last_connected_count = gs_usb_connected_count;
-            printf("[GS_USB] USB connected (count=%lu)\r\n", (unsigned long)last_connected_count);
+            GS_USB_LOG("[GS_USB] USB connected (count=%lu)\r\n", (unsigned long)last_connected_count);
         }
         if (last_disconnected_count != gs_usb_disconnected_count) {
             last_disconnected_count = gs_usb_disconnected_count;
-            printf("[GS_USB] USB disconnected (count=%lu)\r\n", (unsigned long)last_disconnected_count);
+            GS_USB_LOG("[GS_USB] USB disconnected (count=%lu)\r\n", (unsigned long)last_disconnected_count);
         }
         if (last_suspend_count != gs_usb_suspend_count) {
             last_suspend_count = gs_usb_suspend_count;
-            printf("[GS_USB] USB suspend (count=%lu)\r\n", (unsigned long)last_suspend_count);
+            GS_USB_LOG("[GS_USB] USB suspend (count=%lu)\r\n", (unsigned long)last_suspend_count);
         }
         if (last_resume_count != gs_usb_resume_count) {
             last_resume_count = gs_usb_resume_count;
-            printf("[GS_USB] USB resume (count=%lu)\r\n", (unsigned long)last_resume_count);
+            GS_USB_LOG("[GS_USB] USB resume (count=%lu)\r\n", (unsigned long)last_resume_count);
         }
         if (last_reset_count != gs_usb_reset_count) {
             last_reset_count = gs_usb_reset_count;
-            printf("[GS_USB] USB reset (count=%lu)\r\n", (unsigned long)last_reset_count);
+            GS_USB_LOG("[GS_USB] USB reset (count=%lu)\r\n", (unsigned long)last_reset_count);
         }
         if (last_configured_count != gs_usb_configured_count) {
             last_configured_count = gs_usb_configured_count;
-            printf("[GS_USB] USB configured (count=%lu)\r\n", (unsigned long)last_configured_count);
+            GS_USB_LOG("[GS_USB] USB configured (count=%lu)\r\n", (unsigned long)last_configured_count);
         }
 
         if (!gs_usb_configured) {

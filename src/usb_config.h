@@ -21,11 +21,11 @@
 #endif
 
 #ifndef CONFIG_USB_DBG_LEVEL
-#define CONFIG_USB_DBG_LEVEL 0
+#define CONFIG_USB_DBG_LEVEL -1
 #endif
 
 /* Force full-speed for bring-up diagnostics. */
-#define CONFIG_USB_DEVICE_FORCE_FULL_SPEED
+/* #define CONFIG_USB_DEVICE_FORCE_FULL_SPEED */
 
 #if defined(CONFIG_USB_DEVICE_FS) || defined(CONFIG_USB_DEVICE_FORCE_FULL_SPEED)
 #undef CONFIG_USB_HS
@@ -38,7 +38,7 @@
 /* Enable print with color */
 #define CONFIG_USB_PRINTF_COLOR_ENABLE
 
-/* #define CONFIG_USB_DCACHE_ENABLE */
+#define CONFIG_USB_DCACHE_ENABLE
 
 /* data align size when use dma or use dcache */
 #ifdef CONFIG_USB_DCACHE_ENABLE

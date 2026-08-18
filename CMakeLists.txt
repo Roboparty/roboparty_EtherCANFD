@@ -109,8 +109,6 @@ endif()
 
 # ---- SDK compile definitions ----
 sdk_compile_definitions(-DCONFIG_USB_HS=1)
-sdk_compile_definitions(-DCONFIG_USB_DEVICE_FORCE_FULL_SPEED=1)
-sdk_compile_definitions(-DCONFIG_NOT_ENABLE_DCACHE=1)
 sdk_compile_definitions(-DCONFIG_CHERRYUSB_DEVICE=1)
 sdk_compile_definitions(-DUSB_MAX_EP0_SIZE=64)
 sdk_compile_definitions(-DCONFIG_CANFD_ECHO=1)
