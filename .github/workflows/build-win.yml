@@ -13,18 +13,14 @@ jobs:
       - name: Checkout firmware source
         uses: actions/checkout@v4
 
-      - name: Cache SDK environment
-        id: cache-sdk
-        uses: actions/cache@v4
-        with:
-          path: C:\sdk_env
-          key: sdk-env-${{ runner.os }}-${{ github.run_month }}
-
-      - name: Clone SDK environment
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
+      - name: Clone or update SDK environment
         run: |
-          if (Test-Path C:\sdk_env) { Remove-Item -Recurse -Force C:\sdk_env }
-          git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
+          if (Test-Path C:\sdk_env) {
+            git -C C:\sdk_env pull --ff-only --depth 1
+            git -C C:\sdk_env submodule update --init --depth 1
+          } else {
+            git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
+          }
 
       - name: Set environment
         run: |

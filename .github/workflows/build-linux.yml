@@ -12,23 +12,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache SDK
-        id: cache-sdk
-        uses: actions/cache@v4
-        with:
-          path: ~/sdk_env
-          key: sdk-env-${{ runner.os }}-${{ github.run_month }}
-
-      - name: Clone SDK
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
+      - name: Clone or update SDK
         run: |
-          git clone https://github.com/hpmicro/sdk_env.git --depth 1 ~/sdk_env
-          cd ~/sdk_env
-          git submodule update --init --depth 1 hpm_sdk
-          cd toolchains
-          wget https://github.com/hpmicro/riscv-gnu-toolchain/releases/download/2023.10.18/rv32imac_zicsr_zifencei_multilib_b_ext-linux.tar.gz
-          tar -zxf rv32imac_zicsr_zifencei_multilib_b_ext-linux.tar.gz
-          rm rv32imac_zicsr_zifencei_multilib_b_ext-linux.tar.gz
+          if [ -d ~/sdk_env ]; then
+            git -C ~/sdk_env pull --ff-only --depth 1
+            git -C ~/sdk_env submodule update --init --depth 1 hpm_sdk
+          else
+            git clone https://github.com/hpmicro/sdk_env.git --depth 1 ~/sdk_env
+            cd ~/sdk_env
+            git submodule update --init --depth 1 hpm_sdk
+          fi
+
+      - name: Download toolchain
+        run: |
+          TC_DIR=~/sdk_env/toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-linux
+          if [ ! -d "$TC_DIR" ]; then
+            cd ~/sdk_env/toolchains
+            wget -q https://github.com/hpmicro/riscv-gnu-toolchain/releases/download/2023.10.18/rv32imac_zicsr_zifencei_multilib_b_ext-linux.tar.gz
+            tar -zxf rv32imac_zicsr_zifencei_multilib_b_ext-linux.tar.gz
+            rm rv32imac_zicsr_zifencei_multilib_b_ext-linux.tar.gz
+          fi
 
       - name: Install deps
         run: |
