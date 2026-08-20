@@ -81,4 +81,4 @@ cmake --build build --target jlink_flash
 
 
 # roboto_usb4can CAN FD 1M/5M (gs_usb)
-SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="2323", ATTRS{serial}=="202604070001", KERNEL=="can*", RUN+="/sbin/ip link set %k type can bitrate 1000000 sample-point 0.800 sjw 4 dbitrate 5000000 dsample-point 0.750 dsjw 2 fd on", RUN+="/sbin/ip link set %k mtu 72", RUN+="/sbin/ip link set %k txqueuelen 10000", RUN+="/sbin/ip link set %k up"
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="2323", ATTRS{serial}=="202604070001", KERNEL=="can*", RUN+="/sbin/ip link set %k type can bitrate 1000000 sample-point 0.800 sjw 4 dbitrate 5000000 dsample-point 0.750 dsjw 2 fd on one-shot on restart-ms 100", RUN+="/sbin/ip link set %k mtu 72", RUN+="/sbin/ip link set %k txqueuelen 100", RUN+="/sbin/ip link set %k up"

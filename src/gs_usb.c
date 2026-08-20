@@ -98,6 +98,17 @@ extern void USBD_IRQHandler(uint8_t busid);
 #define GS_CAN_FEATURE_FD               (1<<8)
 #define GS_CAN_FEATURE_BT_CONST_EXT     (1<<10)
 
+/* Default the controller to one-shot (no auto-retransmission) even when the
+ * host does not request it. Auto-retransmission of stale motion commands is
+ * undesirable: on an E-stop power cut the bus loses all receivers, the
+ * controller becomes error-passive (the single-node ACK error exception keeps
+ * TEC from reaching bus-off), and auto-retransmission jams the TX FIFO until
+ * the ring overflows and the host hits ENOBUFS. Set to 0 to honor only the
+ * host one-shot request. */
+#ifndef CONFIG_GS_USB_DEFAULT_ONE_SHOT
+#define CONFIG_GS_USB_DEFAULT_ONE_SHOT 1
+#endif
+
 /* gs_usb data structures */
 struct gs_host_config {
     uint32_t byte_order;
@@ -511,6 +522,34 @@ static void gs_usb_resume_out_if_possible(void)
     usbd_ep_start_read(0, GS_USB_EP_OUT, ep_out_buffer, GS_USB_MAX_PACKET_SIZE);
 }
 
+static uint8_t gs_usb_get_channel_error_state(uint8_t ch)
+{
+    mcan_protocol_status_t psr;
+
+    if (mcan_get_protocol_status(mcan_channels[ch].base, &psr) != status_success) {
+        return 0;
+    }
+    if (psr.in_bus_off_state) {
+        return 3;
+    }
+    if (psr.in_error_passive_state) {
+        return 2;
+    }
+    if (psr.in_warning_state) {
+        return 1;
+    }
+    return 0;
+}
+
+static void gs_usb_flush_tx_ring(uint8_t ch)
+{
+    struct tx_ring_item item;
+
+    while (tx_ring_pop(ch, &item)) {
+        (void)enqueue_in_msg(&item.host_frame, item.frame_len);
+    }
+}
+
 static void gs_usb_finish_tx(uint8_t ch, bool success)
 {
     if (ch >= GS_USB_CAN_CHANNEL_COUNT) {
@@ -524,10 +563,10 @@ static void gs_usb_finish_tx(uint8_t ch, bool success)
                                                    (1UL << can_tx_states[ch].fifo_index));
     }
 
-    if (success && can_tx_states[ch].inflight_valid) {
+    if (can_tx_states[ch].inflight_valid) {
         (void)enqueue_in_msg(&can_tx_states[ch].inflight_item.host_frame,
                              can_tx_states[ch].inflight_item.frame_len);
-        if (can_tx_states[ch].inflight_item.loopback) {
+        if (success && can_tx_states[ch].inflight_item.loopback) {
             struct gs_host_frame rx_echo;
             memcpy(&rx_echo, &can_tx_states[ch].inflight_item.host_frame, can_tx_states[ch].inflight_item.frame_len);
             rx_echo.echo_id = 0xFFFFFFFFU;
@@ -834,6 +873,7 @@ static void gs_usb_service_tx_timeouts(void)
         mcan_protocol_status_t psr;
         mcan_error_count_t ecr;
         uint32_t fifo_index;
+        uint8_t err_state;
 
         if (!can_tx_states[ch].busy || can_tx_states[ch].start_us == 0U) {
             continue;
@@ -845,7 +885,6 @@ static void gs_usb_service_tx_timeouts(void)
 
         fifo_index = can_tx_states[ch].fifo_index;
         if (!mcan_is_transmit_request_pending(mcan_channels[ch].base, fifo_index)) {
-            /* Watchdog: If pending bit is cleared but busy is still true, force finish */
             if (can_tx_states[ch].busy) {
                 gs_usb_finish_tx(ch, false);
             }
@@ -864,11 +903,16 @@ static void gs_usb_service_tx_timeouts(void)
                    (unsigned)ecr.transmit_error_count,
                    (unsigned)ecr.receive_error_count);
 
-        if (psr.in_bus_off_state) {
+        err_state = gs_usb_get_channel_error_state(ch);
+        if (err_state >= 2U) {
+            if (fifo_index < 32U) {
+                mcan_cancel_tx_buf_send_request(mcan_channels[ch].base, fifo_index);
+            }
+            gs_usb_flush_tx_ring(ch);
+            gs_usb_finish_tx(ch, false);
             continue;
         }
 
-        /* If twice the timeout has passed, force finish even if cancellation hasn't completed */
         if ((now_us - can_tx_states[ch].start_us) > (GS_USB_TX_TIMEOUT_US * 2U)) {
             gs_usb_finish_tx(ch, false);
             continue;
@@ -970,7 +1014,7 @@ int gs_usb_vendor_request_handler(uint8_t busid, struct usb_setup_packet *setup,
 
     /* Host-side variants sometimes swap device_config (12) and bt_const (40). */
     if ((setup->bmRequestType & USB_REQUEST_DIR_MASK) && (setup->wLength == 40) && (req == GS_USB_BREQ_DEVICE_CONFIG)) {
-        bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_FD;
+        bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_ONE_SHOT | GS_CAN_FEATURE_FD;
         bt_const.fclk_can = gs_usb_can_clk;
         bt_const.tseg1_min = 1;
         bt_const.tseg1_max = 256;
@@ -1045,7 +1089,7 @@ int gs_usb_vendor_request_handler(uint8_t busid, struct usb_setup_packet *setup,
         case GS_USB_BREQ_BT_CONST:
         case GS_USB_BREQ_BT_CONST_EXT:
             // Return hardware bit timing constraints (assumes 40MHz CAN clock for calculation)
-bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_FD | GS_CAN_FEATURE_BT_CONST_EXT;
+bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_ONE_SHOT | GS_CAN_FEATURE_FD | GS_CAN_FEATURE_BT_CONST_EXT;
             bt_const.fclk_can = gs_usb_can_clk; 
             
             if (req == GS_USB_BREQ_BT_CONST_EXT) {
@@ -1137,7 +1181,7 @@ bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CA
                     /* 确保启用 ISO 模式以匹配周立功的默认设置 */
                     mcan_channels[val].config.enable_non_iso_mode = false;
                     
-                    mcan_channels[val].config.disable_auto_retransmission = (mcan_channels[val].mode_flags & GS_CAN_MODE_ONE_SHOT) != 0;
+                    mcan_channels[val].config.disable_auto_retransmission = CONFIG_GS_USB_DEFAULT_ONE_SHOT || ((mcan_channels[val].mode_flags & GS_CAN_MODE_ONE_SHOT) != 0);
                     if (mcan_channels[val].mode_flags & GS_CAN_MODE_LOOP_BACK) {
                         mcan_channels[val].config.mode = mcan_mode_loopback_internal;
                     } else if (mcan_channels[val].mode_flags & GS_CAN_MODE_LISTEN_ONLY) {
