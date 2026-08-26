@@ -12,6 +12,7 @@
 #include "hpm_csr_drv.h"
 #include "hpm_sysctl_drv.h"
 #include "hpm_mcan_drv.h"
+#include "version.h"
 #include "hpm_clock_drv.h"
 #include "hpm_ewdg_drv.h"
 #include "hpm_interrupt.h"
@@ -226,7 +227,7 @@ USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) uint8_t
 
 USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_langid[] = { 0x09, 0x04 };
 USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_manufacturer[] = "wentywenty";
-USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_product[] = "roboto_usb4can";
+USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_product[] = "roboto_usb4can v" FIRMWARE_VERSION;
 USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_serial[] = "202604070001";
 
 static const char *gs_usb_string_descriptors[] = {

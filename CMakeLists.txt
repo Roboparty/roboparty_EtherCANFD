@@ -55,20 +55,13 @@ else()
     set(FW_PATCH 0)
 endif()
 
-# ---- USB bcdDevice (BCD major.minor) ----
-function(_int2bcd val out)
-    math(EXPR _t "${val} / 10")
-    math(EXPR _o "${val} % 10")
-    math(EXPR _bcd "${_t} * 16 + ${_o}")
-    set(${out} ${_bcd} PARENT_SCOPE)
-endfunction()
-
-if(FW_MAJOR EQUAL 0)
-    set(FW_MAJOR 1)
+# ---- USB bcdDevice (MM.m.p, displayed by lsusb as MM.mp) ----
+if(FW_MAJOR GREATER 99 OR FW_MINOR GREATER 9 OR FW_PATCH GREATER 9)
+    message(FATAL_ERROR "Firmware version ${FW_MAJOR}.${FW_MINOR}.${FW_PATCH} cannot be encoded in USB bcdDevice")
 endif()
-_int2bcd(${FW_MAJOR} _bcd_maj)
-_int2bcd(${FW_MINOR} _bcd_min)
-math(EXPR FW_BCD_DEVICE "${_bcd_maj} * 256 + ${_bcd_min}")
+math(EXPR _bcd_major_tens "${FW_MAJOR} / 10")
+math(EXPR _bcd_major_ones "${FW_MAJOR} % 10")
+math(EXPR FW_BCD_DEVICE "${_bcd_major_tens} * 4096 + ${_bcd_major_ones} * 256 + ${FW_MINOR} * 16 + ${FW_PATCH}")
 
 # ---- EtherCAT REVISION_NUMBER ----
 math(EXPR FW_REVISION "${FW_MAJOR} * 65536 + ${FW_MINOR} * 256 + ${FW_PATCH}")
