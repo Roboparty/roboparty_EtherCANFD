@@ -13,10 +13,8 @@ if(NOT EXISTS "${SSC_GEN_STAMP}"
    OR "${SSC_ESP}" IS_NEWER_THAN "${SSC_GEN_STAMP}"
    OR "${SSC_XLSX}" IS_NEWER_THAN "${SSC_GEN_STAMP}")
     message(STATUS "SSC generation: ${SSC_ESP} -> Src/")
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E remove_directory "${SSC_GEN_TMP}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${SSC_GEN_TMP}"
-    )
+    file(REMOVE_RECURSE "${SSC_GEN_TMP}")
+    file(MAKE_DIRECTORY "${SSC_GEN_TMP}")
     execute_process(
         COMMAND "${SSC_TOOL_CMD}" -o "${SSC_GEN_TMP}" -p "${SSC_ESP}"
         RESULT_VARIABLE _ssc_res

@@ -284,6 +284,7 @@ static const char *gs_usb_string_descriptor_callback(uint8_t speed, uint8_t inde
 #define TX_RING_HIGH_WATERMARK   ((TX_RING_SIZE_PER_CH * 9U) / 10U)
 #define TX_RING_LOW_WATERMARK    ((TX_RING_SIZE_PER_CH * 3U) / 10U)
 #define GS_USB_TX_TIMEOUT_US     20000U
+#define GS_USB_BUSOFF_RECOVERY_DELAY_MS 100U  /* Delay before bus-off recovery attempt */
 
 struct gs_can_channel {
     MCAN_Type *base;
@@ -293,6 +294,7 @@ struct gs_can_channel {
     bool have_can_timing;
     bool have_canfd_timing;
     uint32_t mode_flags;
+    uint64_t busoff_detect_us; // bus-off 检测时间戳，0 表示未处于 bus-off
 };
 
 #if defined(MCAN_SOC_MSG_BUF_IN_AHB_RAM) && (MCAN_SOC_MSG_BUF_IN_AHB_RAM == 1)
@@ -303,10 +305,10 @@ extern uint32_t s_mcan_msg_buf3[MCAN_MSG_BUF_SIZE_IN_WORDS];
 #endif
 
 static struct gs_can_channel mcan_channels[4] = {
-    { .base = HPM_MCAN0, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0 },
-    { .base = HPM_MCAN1, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0 },
-    { .base = HPM_MCAN2, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0 },
-    { .base = HPM_MCAN3, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0 }
+    { .base = HPM_MCAN0, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 },
+    { .base = HPM_MCAN1, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 },
+    { .base = HPM_MCAN2, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 },
+    { .base = HPM_MCAN3, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 }
 };
 
 static const uint32_t mcan_irqs[GS_USB_CAN_CHANNEL_COUNT] = {
@@ -391,6 +393,7 @@ static void gs_usb_kick_can_tx(uint8_t ch);
 static void gs_usb_resume_out_if_possible(void);
 static void gs_usb_service_tx_timeouts(void);
 static void gs_usb_service_tx_complete_poll(void);
+static void gs_usb_recover_channel(uint8_t ch);
 
 static uint32_t gs_usb_irq_save(void)
 {
@@ -788,6 +791,7 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
             can_tx_states[ch].start_us = 0U;
             can_tx_states[ch].marker = 0U;
             can_tx_states[ch].inflight_valid = false;
+            mcan_channels[ch].busoff_detect_us = 0;
         }
         break;
     case USBD_EVENT_SUSPEND:
@@ -822,6 +826,7 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
             can_tx_states[ch].start_us = 0U;
             can_tx_states[ch].marker = 0U;
             can_tx_states[ch].inflight_valid = false;
+            mcan_channels[ch].busoff_detect_us = 0;
         }
         break;
     default:
@@ -914,6 +919,10 @@ static void gs_usb_service_tx_timeouts(void)
         }
 
         if ((now_us - can_tx_states[ch].start_us) > (GS_USB_TX_TIMEOUT_US * 2U)) {
+            /* 二次超时：先取消硬件 TX buffer 再结束，防止 TX FIFO 槽位泄漏 */
+            if (fifo_index < 32U) {
+                mcan_cancel_tx_buf_send_request(mcan_channels[ch].base, fifo_index);
+            }
             gs_usb_finish_tx(ch, false);
             continue;
         }
@@ -924,6 +933,116 @@ static void gs_usb_service_tx_timeouts(void)
 
         can_tx_states[ch].start_us = now_us;
     }
+}
+
+/*
+ * Bus-off 恢复：重新初始化 MCAN 控制器
+ * 当控制器进入 bus-off 状态后，硬件需要看到 128 次 bus idle 才能自动恢复。
+ * 如果总线上没有其他节点，自动恢复可能永远不会触发。
+ * 此函数通过 deinit + reinit 强制复位控制器状态，清空错误计数器。
+ */
+static void gs_usb_recover_channel(uint8_t ch)
+{
+    if (ch >= GS_USB_CAN_CHANNEL_COUNT || !mcan_channels[ch].is_open) {
+        return;
+    }
+
+    printf("[GS_USB] ch=%u bus-off recovery: reinit MCAN\r\n", (unsigned)ch);
+
+    /* 保存当前配置 */
+    mcan_bit_timing_param_t saved_can_timing = mcan_channels[ch].config.can_timing;
+    mcan_bit_timing_param_t saved_canfd_timing = mcan_channels[ch].config.canfd_timing;
+    uint32_t saved_mode_flags = mcan_channels[ch].mode_flags;
+    bool saved_enable_canfd = mcan_channels[ch].config.enable_canfd;
+
+    /* 取消所有 pending TX */
+    if (can_tx_states[ch].busy) {
+        uint32_t fifo_index = can_tx_states[ch].fifo_index;
+        if (fifo_index < 32U) {
+            mcan_cancel_tx_buf_send_request(mcan_channels[ch].base, fifo_index);
+        }
+        gs_usb_flush_tx_ring(ch);
+        /* 手动清理 TX 状态（不调用 gs_usb_finish_tx，因为即将 deinit） */
+        can_tx_states[ch].busy = false;
+        can_tx_states[ch].fifo_index = 0;
+        can_tx_states[ch].start_us = 0U;
+        can_tx_states[ch].marker = 0U;
+        can_tx_states[ch].inflight_valid = false;
+    }
+
+    /* 禁用中断 */
+    intc_m_disable_irq(mcan_irqs[ch]);
+
+    /* deinit + reinit */
+    mcan_deinit(mcan_channels[ch].base);
+
+#if defined(MCAN_SOC_MSG_BUF_IN_AHB_RAM) && (MCAN_SOC_MSG_BUF_IN_AHB_RAM == 1)
+    {
+        mcan_msg_buf_attr_t attr;
+        if (ch == 0) { mcan_msg_buf_attr_t tmp = { (uint32_t)&s_mcan_msg_buf0, sizeof(s_mcan_msg_buf0) }; attr = tmp; }
+        else if (ch == 1) { mcan_msg_buf_attr_t tmp = { (uint32_t)&s_mcan_msg_buf1, sizeof(s_mcan_msg_buf1) }; attr = tmp; }
+        else if (ch == 2) { mcan_msg_buf_attr_t tmp = { (uint32_t)&s_mcan_msg_buf2, sizeof(s_mcan_msg_buf2) }; attr = tmp; }
+        else { mcan_msg_buf_attr_t tmp = { (uint32_t)&s_mcan_msg_buf3, sizeof(s_mcan_msg_buf3) }; attr = tmp; }
+        mcan_set_msg_buf_attr(mcan_channels[ch].base, &attr);
+    }
+#endif
+
+    /* 恢复配置 */
+    mcan_get_default_config(mcan_channels[ch].base, &mcan_channels[ch].config);
+    mcan_channels[ch].config.use_lowlevel_timing_setting = true;
+    mcan_channels[ch].config.can_timing = saved_can_timing;
+    mcan_channels[ch].config.canfd_timing = saved_canfd_timing;
+    mcan_channels[ch].config.enable_canfd = saved_enable_canfd;
+
+    mcan_get_default_ram_config(mcan_channels[ch].base, &mcan_channels[ch].config.ram_config, mcan_channels[ch].config.enable_canfd);
+    mcan_channels[ch].config.ram_config.enable_tx_evt_fifo = true;
+    mcan_channels[ch].config.ram_config.tx_evt_fifo_watermark = 1;
+
+    mcan_channels[ch].config.enable_tdc = mcan_channels[ch].config.enable_canfd;
+    if (mcan_channels[ch].config.enable_tdc) {
+        mcan_channels[ch].config.tdc_config.ssp_offset = 7;
+        mcan_channels[ch].config.tdc_config.filter_window_length = 0;
+    }
+    mcan_channels[ch].config.enable_non_iso_mode = false;
+    mcan_channels[ch].config.disable_auto_retransmission = CONFIG_GS_USB_DEFAULT_ONE_SHOT || ((saved_mode_flags & GS_CAN_MODE_ONE_SHOT) != 0);
+
+    if (saved_mode_flags & GS_CAN_MODE_LOOP_BACK) {
+        mcan_channels[ch].config.mode = mcan_mode_loopback_internal;
+    } else if (saved_mode_flags & GS_CAN_MODE_LISTEN_ONLY) {
+        mcan_channels[ch].config.mode = mcan_mode_listen_only;
+        mcan_channels[ch].config.enable_restricted_operation_mode = true;
+    } else {
+        mcan_channels[ch].config.mode = mcan_mode_normal;
+    }
+
+    hpm_stat_t stat = mcan_init(mcan_channels[ch].base, &mcan_channels[ch].config, gs_usb_can_clk);
+    if (stat != status_success) {
+        printf("[GS_USB] ch=%u bus-off recovery FAILED: stat=%ld\r\n", (unsigned)ch, (long)stat);
+        return;
+    }
+
+    /* 配置全局滤波器 */
+    mcan_global_filter_config_t filter = {0};
+    filter.accept_non_matching_std_frame_option = 0;
+    filter.accept_non_matching_ext_frame_option = 0;
+    mcan_set_global_filter_config(mcan_channels[ch].base, &filter);
+
+    /* 清空错误计数器 */
+    ((volatile uint32_t *)(mcan_channels[ch].base))[0x40/4] = 0;
+
+    /* 重置状态 */
+    mcan_channels[ch].error_state = 0;
+    mcan_channels[ch].busoff_detect_us = 0;
+    tx_rings[ch].head = 0;
+    tx_rings[ch].tail = 0;
+    tx_rings[ch].count = 0;
+
+    /* 重新使能中断 */
+    mcan_enable_interrupts(mcan_channels[ch].base,
+                           MCAN_INT_TX_COMPLETED | MCAN_INT_TX_CANCEL_FINISHED);
+    intc_m_enable_irq_with_priority(mcan_irqs[ch], 2);
+
+    printf("[GS_USB] ch=%u bus-off recovery OK\r\n", (unsigned)ch);
 }
 
 static void gs_usb_service_tx_complete_poll(void)
@@ -1128,6 +1247,7 @@ bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CA
                     intc_m_disable_irq(mcan_irqs[val]);
                     mcan_channels[val].is_open = false;
                     mcan_channels[val].error_state = 0;
+                    mcan_channels[val].busoff_detect_us = 0;
                     tx_rings[val].head = 0;
                     tx_rings[val].tail = 0;
                     tx_rings[val].count = 0;
@@ -1220,6 +1340,7 @@ bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CA
                         mcan_set_global_filter_config(mcan_channels[val].base, &filter);
                         ((volatile uint32_t *)(mcan_channels[val].base))[0x40/4] = 0; // Clear ECR (error counters)
                         mcan_channels[val].error_state = 0;
+                        mcan_channels[val].busoff_detect_us = 0;
                         mcan_enable_interrupts(mcan_channels[val].base,
                                                MCAN_INT_TX_COMPLETED | MCAN_INT_TX_CANCEL_FINISHED);
                         intc_m_enable_irq_with_priority(mcan_irqs[val], 2);
@@ -1641,6 +1762,10 @@ void gs_usb_run(void)
                                    (unsigned long)mcan_channels[i].base->PSR);
                         }
                         (void)enqueue_in_msg(&err_hf, 20U);
+                        /* 记录 bus-off 时间戳，稍后自动恢复 */
+                        if (mcan_channels[i].busoff_detect_us == 0) {
+                            mcan_channels[i].busoff_detect_us = gs_usb_get_time_us();
+                        }
                         continue;
                     } else if (current_err_state == 2) { // Error Passive
                         mcan_error_count_t ecr;
@@ -1654,9 +1779,18 @@ void gs_usb_run(void)
                         if (ecr.transmit_error_count >= 96) err_hf.data[1] |= CAN_ERR_CRTL_TX_WARNING;
                     } else { // Back to Active
                         err_hf.data[1] = 0; // Clear all error flags
+                        mcan_channels[i].busoff_detect_us = 0; // 清除 bus-off 时间戳
                     }
 
                     (void)enqueue_in_msg(&err_hf, 20U);
+                }
+
+                /* Bus-off 延迟恢复检查：如果处于 bus-off 超过 100ms，自动恢复 */
+                if (mcan_channels[i].busoff_detect_us != 0) {
+                    uint64_t now_us = gs_usb_get_time_us();
+                    if ((now_us - mcan_channels[i].busoff_detect_us) >= (GS_USB_BUSOFF_RECOVERY_DELAY_MS * 1000U)) {
+                        gs_usb_recover_channel((uint8_t)i);
+                    }
                 }
                 
                 mcan_rx_message_t rx_msg;
