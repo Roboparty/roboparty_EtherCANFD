@@ -285,7 +285,15 @@ static const char *gs_usb_string_descriptor_callback(uint8_t speed, uint8_t inde
 #define TX_RING_HIGH_WATERMARK   ((TX_RING_SIZE_PER_CH * 9U) / 10U)
 #define TX_RING_LOW_WATERMARK    ((TX_RING_SIZE_PER_CH * 3U) / 10U)
 #define GS_USB_TX_TIMEOUT_US     20000U
+#define GS_USB_EP_IN_TIMEOUT_US  500000U /* Recover an IN transfer with no completion after 500 ms */
+#define GS_USB_EP_IN_FLUSH_TIMEOUT_US 2000U /* Never wait forever for ENDPTFLUSH */
+#define GS_USB_EP_IN_RECOVERY_COOLDOWN_US 5000000U
+#define GS_USB_EP_IN_RECOVERY_MAX_STREAK 2U
+#define GS_USB_RX_DRAIN_LIMIT    32U     /* Bound RX work per channel/main-loop pass */
+#define GS_USB_TX_EVT_DRAIN_LIMIT 32U    /* Bound TX event work per channel/pass */
 #define GS_USB_BUSOFF_RECOVERY_DELAY_MS 100U  /* Delay before bus-off recovery attempt */
+#define GS_USB_BUSOFF_RECOVERY_COOLDOWN_MS 1000U /* Minimum interval between reinit attempts */
+#define GS_USB_ERROR_PASSIVE_RECOVERY_MS 5000U /* Recover only if passive persists */
 
 struct gs_can_channel {
     MCAN_Type *base;
@@ -296,6 +304,8 @@ struct gs_can_channel {
     bool have_canfd_timing;
     uint32_t mode_flags;
     uint64_t busoff_detect_us; // bus-off 检测时间戳，0 表示未处于 bus-off
+    uint64_t busoff_recovery_us; // 上次恢复尝试时间戳，用于冷却限频
+    uint64_t error_passive_detect_us;
 };
 
 #if defined(MCAN_SOC_MSG_BUF_IN_AHB_RAM) && (MCAN_SOC_MSG_BUF_IN_AHB_RAM == 1)
@@ -306,10 +316,10 @@ extern uint32_t s_mcan_msg_buf3[MCAN_MSG_BUF_SIZE_IN_WORDS];
 #endif
 
 static struct gs_can_channel mcan_channels[4] = {
-    { .base = HPM_MCAN0, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 },
-    { .base = HPM_MCAN1, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 },
-    { .base = HPM_MCAN2, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 },
-    { .base = HPM_MCAN3, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0 }
+    { .base = HPM_MCAN0, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0, .busoff_recovery_us = 0, .error_passive_detect_us = 0 },
+    { .base = HPM_MCAN1, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0, .busoff_recovery_us = 0, .error_passive_detect_us = 0 },
+    { .base = HPM_MCAN2, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0, .busoff_recovery_us = 0, .error_passive_detect_us = 0 },
+    { .base = HPM_MCAN3, .is_open = false, .error_state = 0, .have_can_timing = false, .have_canfd_timing = false, .mode_flags = 0, .busoff_detect_us = 0, .busoff_recovery_us = 0, .error_passive_detect_us = 0 }
 };
 
 static const uint32_t mcan_irqs[GS_USB_CAN_CHANNEL_COUNT] = {
@@ -353,11 +363,19 @@ struct can_tx_state {
 };
 
 volatile bool ep_in_busy = false;
+volatile uint64_t ep_in_start_us = 0U;
+volatile bool ep_in_timeout_reported = false;
+volatile uint32_t ep_in_submit_fail_count = 0U;
+volatile uint32_t ep_in_recovery_count = 0U;
+static uint64_t ep_in_last_recovery_us = 0U;
+static uint8_t ep_in_recovery_streak = 0U;
+static bool ep_in_persistent_reported = false;
 volatile uint32_t out_count = 0;
 
 uint32_t gs_usb_can_clk = 80000000; // Will be runtime detected
 
 volatile uint32_t out_drop = 0;
+static uint32_t gs_usb_tx_debug_count = 0;
 volatile bool gs_usb_configured = false;
 volatile uint32_t gs_usb_reset_count = 0;
 volatile uint32_t gs_usb_configured_count = 0;
@@ -368,6 +386,10 @@ volatile uint32_t gs_usb_suspend_count = 0;
 volatile uint32_t gs_usb_resume_count = 0;
 volatile bool gs_usb_out_paused = false;
 volatile bool gs_usb_out_armed = false;
+volatile uint32_t gs_usb_main_loop_count = 0U;
+volatile uint32_t gs_usb_poll_irq_count = 0U;
+volatile uint8_t gs_usb_main_stage = 0U;
+volatile uint32_t gs_usb_can_irq_count[GS_USB_CAN_CHANNEL_COUNT] = {0U};
 
 static uint16_t s_gs_can_led_ticks[GS_USB_CAN_CHANNEL_COUNT];
 static uint32_t s_gs_mode_led_tick;
@@ -437,6 +459,89 @@ static uint64_t gs_usb_get_time_us(void)
 
     cycles = hpm_csr_get_core_mcycle();
     return (cycles * 1000000ULL) / hpm_core_clock;
+}
+
+static bool gs_usb_recover_ep_in(uint64_t now_us)
+{
+    USB_Type *usb = (USB_Type *)HPM_USB0;
+    const uint32_t ep_mask = 1UL << (16U + (GS_USB_EP_IN & 0x0FU));
+    uint64_t flush_start_us;
+    uint32_t prime_before;
+    uint32_t stat_before;
+    uint32_t complete_before;
+    uint32_t complete_after;
+    bool flush_ok = false;
+
+    if (ep_in_last_recovery_us != 0U &&
+        (now_us - ep_in_last_recovery_us) < GS_USB_EP_IN_RECOVERY_COOLDOWN_US) {
+        return false;
+    }
+
+    if (ep_in_recovery_streak >= GS_USB_EP_IN_RECOVERY_MAX_STREAK) {
+        if (!ep_in_persistent_reported) {
+            ep_in_persistent_reported = true;
+            printf("[GS_USB] EP_IN persistent stall; automatic recovery stopped\r\n");
+        }
+        return false;
+    }
+
+    /* Serialize against the normal CherryUSB ISR.  A completion may arrive
+     * between the timeout check and masking the IRQ, so recheck it here. */
+    intc_m_disable_irq(CONFIG_HPM_USBD_IRQn);
+    if (!ep_in_busy || (usb->ENDPTCOMPLETE & ep_mask) != 0U) {
+        intc_m_enable_irq(CONFIG_HPM_USBD_IRQn);
+        return false;
+    }
+
+    prime_before = usb->ENDPTPRIME;
+    stat_before = usb->ENDPTSTAT;
+    complete_before = usb->ENDPTCOMPLETE;
+    ep_in_recovery_count++;
+    ep_in_recovery_streak++;
+    /* Flush only EP1 IN.  The SDK close path waits forever; use the same
+     * hardware sequence with a hard deadline and leave the endpoint enabled
+     * so its data toggle remains synchronized with the host. */
+    flush_start_us = gs_usb_get_time_us();
+    do {
+        usb->ENDPTFLUSH = ep_mask;
+        while ((usb->ENDPTFLUSH & ep_mask) != 0U &&
+               (gs_usb_get_time_us() - flush_start_us) < GS_USB_EP_IN_FLUSH_TIMEOUT_US) {
+        }
+        if ((usb->ENDPTFLUSH & ep_mask) != 0U) {
+            break;
+        }
+        if ((usb->ENDPTSTAT & ep_mask) == 0U) {
+            flush_ok = true;
+            break;
+        }
+    } while ((gs_usb_get_time_us() - flush_start_us) < GS_USB_EP_IN_FLUSH_TIMEOUT_US);
+
+    complete_after = usb->ENDPTCOMPLETE;
+    ep_in_last_recovery_us = now_us;
+    if (flush_ok && (complete_after & ep_mask) == 0U) {
+        ep_in_busy = false;
+        ep_in_start_us = 0U;
+        ep_in_timeout_reported = false;
+    } else if ((complete_after & ep_mask) != 0U) {
+        /* The transfer won the race with FLUSH.  Keep the QTD and queue
+         * ownership intact; the pending normal USB IRQ will complete it. */
+        flush_ok = false;
+    }
+    intc_m_enable_irq(CONFIG_HPM_USBD_IRQn);
+
+    printf("[GS_USB] EP_IN recover #%lu before: PRIME=0x%08lx STAT=0x%08lx COMPLETE=0x%08lx RXQ=%lu\r\n",
+           (unsigned long)ep_in_recovery_count,
+           (unsigned long)prime_before,
+           (unsigned long)stat_before,
+           (unsigned long)complete_before,
+           (unsigned long)((in_q_head + IN_QUEUE_SIZE - in_q_tail) % IN_QUEUE_SIZE));
+    printf("[GS_USB] EP_IN recover #%lu %s after: FLUSH=0x%08lx STAT=0x%08lx COMPLETE=0x%08lx\r\n",
+           (unsigned long)ep_in_recovery_count,
+           flush_ok ? "OK" : (((complete_after & ep_mask) != 0U) ? "COMPLETED" : "FAILED"),
+           (unsigned long)usb->ENDPTFLUSH,
+           (unsigned long)usb->ENDPTSTAT,
+           (unsigned long)usb->ENDPTCOMPLETE);
+    return flush_ok;
 }
 
 static bool tx_ring_push(uint8_t ch, const struct tx_ring_item *item)
@@ -705,6 +810,13 @@ void gs_usb_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
     (void)ep;
 
     out_count++;
+    if (out_count <= 20U) {
+        printf("[GS_USB] EP_OUT #%lu nbytes=%u configured=%u paused=%u\r\n",
+               (unsigned long)out_count,
+               (unsigned)nbytes,
+               gs_usb_configured ? 1U : 0U,
+               gs_usb_out_paused ? 1U : 0U);
+    }
     if (out_count <= 45) {
         GS_USB_LOG("[GS_USB] ep_out %u bytes (count=%lu)\r\n",
                    (unsigned)nbytes,
@@ -739,6 +851,17 @@ void gs_usb_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
         item.loopback = (mcan_channels[ch].mode_flags & GS_CAN_MODE_LOOP_BACK) != 0U;
         memcpy(&item.host_frame, hf, frame_len);
 
+        if (gs_usb_tx_debug_count < 32U) {
+            printf("[GS_USB] TX request #%lu ch=%u id=0x%08lx dlc=%u flags=0x%02x len=%lu\r\n",
+                   (unsigned long)(gs_usb_tx_debug_count + 1U),
+                   (unsigned)ch,
+                   (unsigned long)hf->can_id,
+                   (unsigned)hf->can_dlc,
+                   (unsigned)hf->flags,
+                   (unsigned long)frame_len);
+            gs_usb_tx_debug_count++;
+        }
+
         if (!tx_ring_push(ch, &item)) {
             out_drop++;
             gs_usb_pause_out();
@@ -762,7 +885,20 @@ void gs_usb_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 /* EP IN Callback (MCU -> PC) */
 void gs_usb_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
+    (void)busid;
+    (void)ep;
+    (void)nbytes;
+
+    /* The queue entry remains owned by USB DMA until this real completion
+     * callback.  Never release it merely because a software timer expired. */
+    if (ep_in_busy && in_q_head != in_q_tail) {
+        in_q_tail = (in_q_tail + 1U) % IN_QUEUE_SIZE;
+    }
     ep_in_busy = false;
+    ep_in_start_us = 0U;
+    ep_in_timeout_reported = false;
+    ep_in_recovery_streak = 0U;
+    ep_in_persistent_reported = false;
 }
 
 static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
@@ -781,6 +917,11 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
         gs_usb_out_paused = false;
         gs_usb_out_armed = false;
         ep_in_busy = false;
+        ep_in_start_us = 0U;
+        ep_in_timeout_reported = false;
+        ep_in_last_recovery_us = 0U;
+        ep_in_recovery_streak = 0U;
+        ep_in_persistent_reported = false;
         in_q_head = 0;
         in_q_tail = 0;
         for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
@@ -793,6 +934,7 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
             can_tx_states[ch].marker = 0U;
             can_tx_states[ch].inflight_valid = false;
             mcan_channels[ch].busoff_detect_us = 0;
+            mcan_channels[ch].busoff_recovery_us = 0;
         }
         break;
     case USBD_EVENT_SUSPEND:
@@ -816,6 +958,11 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
         gs_usb_out_paused = false;
         gs_usb_out_armed = false;
         ep_in_busy = false;
+        ep_in_start_us = 0U;
+        ep_in_timeout_reported = false;
+        ep_in_last_recovery_us = 0U;
+        ep_in_recovery_streak = 0U;
+        ep_in_persistent_reported = false;
         in_q_head = 0;
         in_q_tail = 0;
         for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
@@ -828,6 +975,7 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
             can_tx_states[ch].marker = 0U;
             can_tx_states[ch].inflight_valid = false;
             mcan_channels[ch].busoff_detect_us = 0;
+            mcan_channels[ch].busoff_recovery_us = 0;
         }
         break;
     default:
@@ -944,9 +1092,19 @@ static void gs_usb_service_tx_timeouts(void)
  */
 static void gs_usb_recover_channel(uint8_t ch)
 {
+    uint64_t now_us;
+
     if (ch >= GS_USB_CAN_CHANNEL_COUNT || !mcan_channels[ch].is_open) {
         return;
     }
+
+    now_us = gs_usb_get_time_us();
+    if (mcan_channels[ch].busoff_recovery_us != 0U &&
+        (now_us - mcan_channels[ch].busoff_recovery_us) <
+        (GS_USB_BUSOFF_RECOVERY_COOLDOWN_MS * 1000U)) {
+        return;
+    }
+    mcan_channels[ch].busoff_recovery_us = now_us;
 
     printf("[GS_USB] ch=%u bus-off recovery: reinit MCAN\r\n", (unsigned)ch);
 
@@ -975,7 +1133,9 @@ static void gs_usb_recover_channel(uint8_t ch)
     intc_m_disable_irq(mcan_irqs[ch]);
 
     /* deinit + reinit */
+    printf("[GS_USB] ch=%u recovery: before mcan_deinit\r\n", (unsigned)ch);
     mcan_deinit(mcan_channels[ch].base);
+    printf("[GS_USB] ch=%u recovery: after mcan_deinit\r\n", (unsigned)ch);
 
 #if defined(MCAN_SOC_MSG_BUF_IN_AHB_RAM) && (MCAN_SOC_MSG_BUF_IN_AHB_RAM == 1)
     {
@@ -1001,7 +1161,7 @@ static void gs_usb_recover_channel(uint8_t ch)
 
     mcan_channels[ch].config.enable_tdc = mcan_channels[ch].config.enable_canfd;
     if (mcan_channels[ch].config.enable_tdc) {
-        mcan_channels[ch].config.tdc_config.ssp_offset = 7;
+        mcan_channels[ch].config.tdc_config.ssp_offset = 6;
         mcan_channels[ch].config.tdc_config.filter_window_length = 0;
     }
     mcan_channels[ch].config.enable_non_iso_mode = false;
@@ -1016,7 +1176,10 @@ static void gs_usb_recover_channel(uint8_t ch)
         mcan_channels[ch].config.mode = mcan_mode_normal;
     }
 
+    printf("[GS_USB] ch=%u recovery: before mcan_init\r\n", (unsigned)ch);
     hpm_stat_t stat = mcan_init(mcan_channels[ch].base, &mcan_channels[ch].config, gs_usb_can_clk);
+    printf("[GS_USB] ch=%u recovery: after mcan_init stat=%ld\r\n",
+           (unsigned)ch, (long)stat);
     if (stat != status_success) {
         printf("[GS_USB] ch=%u bus-off recovery FAILED: stat=%ld\r\n", (unsigned)ch, (long)stat);
         return;
@@ -1037,6 +1200,12 @@ static void gs_usb_recover_channel(uint8_t ch)
     tx_rings[ch].head = 0;
     tx_rings[ch].tail = 0;
     tx_rings[ch].count = 0;
+    /* Re-arm USB OUT after MCAN recovery so the host can resume TX. */
+    if (gs_usb_configured && !gs_usb_out_armed) {
+        gs_usb_out_paused = false;
+        gs_usb_out_armed = true;
+        usbd_ep_start_read(0, GS_USB_EP_OUT, ep_out_buffer, GS_USB_MAX_PACKET_SIZE);
+    }
 
     /* 重新使能中断 */
     mcan_enable_interrupts(mcan_channels[ch].base,
@@ -1044,6 +1213,10 @@ static void gs_usb_recover_channel(uint8_t ch)
     intc_m_enable_irq_with_priority(mcan_irqs[ch], 2);
 
     printf("[GS_USB] ch=%u bus-off recovery OK\r\n", (unsigned)ch);
+    printf("[GS_USB] ch=%u timing after recovery: DBTP=0x%08lx TDCR=0x%08lx\r\n",
+           (unsigned)ch,
+           (unsigned long)mcan_channels[ch].base->DBTP,
+           (unsigned long)mcan_channels[ch].base->TDCR);
 }
 
 static void gs_usb_service_tx_complete_poll(void)
@@ -1057,8 +1230,13 @@ static void gs_usb_service_tx_complete_poll(void)
             continue;
         }
 
-        /* Drain the Event FIFO even if not busy, to prevent overflow */
-        while (mcan_read_tx_evt_fifo(mcan_channels[ch].base, &tx_evt) == status_success) {
+        /* Drain all pending TX Event FIFO entries in one pass to prevent overflow.
+         * Do not break after completing the in-flight frame: older/stale events
+         * may still be pending and must also be consumed. */
+        uint32_t tx_evt_drained = 0U;
+        while (tx_evt_drained < GS_USB_TX_EVT_DRAIN_LIMIT &&
+               mcan_read_tx_evt_fifo(mcan_channels[ch].base, &tx_evt) == status_success) {
+            tx_evt_drained++;
             GS_USB_LOG("[GS_USB] TX event ch=%u marker=%u evt=%u fifo=%lu\r\n",
                        (unsigned)ch,
                        (unsigned)tx_evt.message_marker,
@@ -1068,7 +1246,6 @@ static void gs_usb_service_tx_complete_poll(void)
             if (can_tx_states[ch].busy && can_tx_states[ch].inflight_valid &&
                 tx_evt.message_marker == can_tx_states[ch].marker) {
                 gs_usb_finish_tx(ch, true);
-                break;
             }
         }
     }
@@ -1077,24 +1254,28 @@ static void gs_usb_service_tx_complete_poll(void)
 SDK_DECLARE_EXT_ISR_M(BOARD_CAN0_IRQn, gs_usb_can0_isr)
 void gs_usb_can0_isr(void)
 {
+    gs_usb_can_irq_count[0]++;
     gs_usb_handle_can_tx_irq(0);
 }
 
 SDK_DECLARE_EXT_ISR_M(BOARD_CAN1_IRQn, gs_usb_can1_isr)
 void gs_usb_can1_isr(void)
 {
+    gs_usb_can_irq_count[1]++;
     gs_usb_handle_can_tx_irq(1);
 }
 
 SDK_DECLARE_EXT_ISR_M(BOARD_CAN2_IRQn, gs_usb_can2_isr)
 void gs_usb_can2_isr(void)
 {
+    gs_usb_can_irq_count[2]++;
     gs_usb_handle_can_tx_irq(2);
 }
 
 SDK_DECLARE_EXT_ISR_M(BOARD_CAN3_IRQn, gs_usb_can3_isr)
 void gs_usb_can3_isr(void)
 {
+    gs_usb_can_irq_count[3]++;
     gs_usb_handle_can_tx_irq(3);
 }
 
@@ -1296,7 +1477,7 @@ bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CA
 
                     mcan_channels[val].config.enable_tdc = mcan_channels[val].config.enable_canfd;
                     if (mcan_channels[val].config.enable_tdc) {
-                        mcan_channels[val].config.tdc_config.ssp_offset = 7;
+                        mcan_channels[val].config.tdc_config.ssp_offset = 6;
                         mcan_channels[val].config.tdc_config.filter_window_length = 0;
                     }
                     /* 确保启用 ISO 模式以匹配周立功的默认设置 */
@@ -1550,6 +1731,7 @@ void gs_usb_run(void)
     board_init_can_clock(HPM_MCAN3);
     
     printf("\r\n==========================================\r\n");
+    printf("[GS_USB] gs_usb.c build: %s %s\r\n", __DATE__, __TIME__);
     printf("[GS_USB] MCAN Clock: %lu Hz\r\n", gs_usb_can_clk);
     printf("[GS_USB] mcan_channels[0] base: 0x%08lX\r\n", (uint32_t)HPM_MCAN0);
 
@@ -1625,35 +1807,76 @@ void gs_usb_run(void)
     gs_usb_watchdog_init();
 
     while (1) {
+        uint64_t loop_now_us;
+        static uint64_t heartbeat_last_us = 0U;
+        uint8_t previous_stage = gs_usb_main_stage;
+        gs_usb_main_loop_count++;
+        /* Emit the heartbeat before entering USB service.  This project also
+         * polls a pending UI status here because the IRQ path alone can leave
+         * a control transfer pending during enumeration on this platform. */
+        loop_now_us = gs_usb_get_time_us();
+        if (heartbeat_last_us == 0U ||
+            (loop_now_us - heartbeat_last_us) >= 1000000U) {
+            heartbeat_last_us = loop_now_us;
+            USB_Type *heartbeat_usb = (USB_Type *)HPM_USB0;
+            printf("[GS_USB] heartbeat pre-usb loops=%lu prev_stage=%u cfg=%u conn=%u USBSTS=0x%08lx poll=%lu OUT=%lu paused=%u armed=%u ring=%u,%u,%u,%u busy=%u,%u,%u,%u RXQ=%lu IN=%u fail=%lu\r\n",
+                   (unsigned long)gs_usb_main_loop_count,
+                   (unsigned)previous_stage,
+                   gs_usb_configured ? 1U : 0U,
+                   gs_usb_is_connected ? 1U : 0U,
+                   (unsigned long)heartbeat_usb->USBSTS,
+                   (unsigned long)gs_usb_poll_irq_count,
+                   (unsigned long)out_count,
+                   gs_usb_out_paused ? 1U : 0U,
+                   gs_usb_out_armed ? 1U : 0U,
+                   (unsigned)tx_ring_count(0),
+                   (unsigned)tx_ring_count(1),
+                   (unsigned)tx_ring_count(2),
+                   (unsigned)tx_ring_count(3),
+                   can_tx_states[0].busy ? 1U : 0U,
+                   can_tx_states[1].busy ? 1U : 0U,
+                   can_tx_states[2].busy ? 1U : 0U,
+                   can_tx_states[3].busy ? 1U : 0U,
+                   (unsigned long)((in_q_head + IN_QUEUE_SIZE - in_q_tail) % IN_QUEUE_SIZE),
+                   ep_in_busy ? 1U : 0U,
+                   (unsigned long)ep_in_submit_fail_count);
+        }
+        gs_usb_main_stage = 1U; /* USB service */
         ewdg_refresh(HPM_EWDG0);
         USB_Type *usb = (USB_Type *)HPM_USB0;
+
+        /* The same CherryUSB handler is also entered from hpm_isr_usb0().
+         * Serialize this polling fallback with the hardware IRQ so QHD/QTD
+         * completion processing can never be re-entered. */
+        intc_m_disable_irq(CONFIG_HPM_USBD_IRQn);
         if (usb->USBSTS & USB_USBSTS_UI_MASK) {
+            gs_usb_poll_irq_count++;
             USBD_IRQHandler(0);
         }
-
+        intc_m_enable_irq(CONFIG_HPM_USBD_IRQn);
         if (last_connected_count != gs_usb_connected_count) {
             last_connected_count = gs_usb_connected_count;
-            GS_USB_LOG("[GS_USB] USB connected (count=%lu)\r\n", (unsigned long)last_connected_count);
+            printf("[GS_USB] USB connected (count=%lu)\r\n", (unsigned long)last_connected_count);
         }
         if (last_disconnected_count != gs_usb_disconnected_count) {
             last_disconnected_count = gs_usb_disconnected_count;
-            GS_USB_LOG("[GS_USB] USB disconnected (count=%lu)\r\n", (unsigned long)last_disconnected_count);
+            printf("[GS_USB] USB disconnected (count=%lu)\r\n", (unsigned long)last_disconnected_count);
         }
         if (last_suspend_count != gs_usb_suspend_count) {
             last_suspend_count = gs_usb_suspend_count;
-            GS_USB_LOG("[GS_USB] USB suspend (count=%lu)\r\n", (unsigned long)last_suspend_count);
+            printf("[GS_USB] USB suspend (count=%lu)\r\n", (unsigned long)last_suspend_count);
         }
         if (last_resume_count != gs_usb_resume_count) {
             last_resume_count = gs_usb_resume_count;
-            GS_USB_LOG("[GS_USB] USB resume (count=%lu)\r\n", (unsigned long)last_resume_count);
+            printf("[GS_USB] USB resume (count=%lu)\r\n", (unsigned long)last_resume_count);
         }
         if (last_reset_count != gs_usb_reset_count) {
             last_reset_count = gs_usb_reset_count;
-            GS_USB_LOG("[GS_USB] USB reset (count=%lu)\r\n", (unsigned long)last_reset_count);
+            printf("[GS_USB] USB reset (count=%lu)\r\n", (unsigned long)last_reset_count);
         }
         if (last_configured_count != gs_usb_configured_count) {
             last_configured_count = gs_usb_configured_count;
-            GS_USB_LOG("[GS_USB] USB configured (count=%lu)\r\n", (unsigned long)last_configured_count);
+            printf("[GS_USB] USB configured (count=%lu)\r\n", (unsigned long)last_configured_count);
         }
 
         if (!gs_usb_configured) {
@@ -1689,9 +1912,29 @@ void gs_usb_run(void)
             continue; // 在主机配置好 USB (分配地址+枚举结束) 之前，跳过疯狂扫描外设防止总线阻塞导致 DMA 或中断受影响
         }
 
+        gs_usb_main_stage = 2U; /* TX event FIFO */
         gs_usb_service_tx_complete_poll();
+        gs_usb_main_stage = 3U; /* TX timeout */
         gs_usb_service_tx_timeouts();
 
+        /* Never clear the software busy flag without first aborting the QTD.
+         * A bounded EP1-IN-only flush preserves the queue entry for retry. */
+        if (ep_in_busy && ep_in_start_us != 0U &&
+            (gs_usb_get_time_us() - ep_in_start_us) >= GS_USB_EP_IN_TIMEOUT_US) {
+            uint64_t timeout_now_us = gs_usb_get_time_us();
+            if (!ep_in_timeout_reported) {
+                USB_Type *timeout_usb = (USB_Type *)HPM_USB0;
+                ep_in_timeout_reported = true;
+                printf("[GS_USB] EP_IN timeout: PRIME=0x%08lx STAT=0x%08lx COMPLETE=0x%08lx RXQ=%lu\r\n",
+                       (unsigned long)timeout_usb->ENDPTPRIME,
+                       (unsigned long)timeout_usb->ENDPTSTAT,
+                       (unsigned long)timeout_usb->ENDPTCOMPLETE,
+                       (unsigned long)((in_q_head + IN_QUEUE_SIZE - in_q_tail) % IN_QUEUE_SIZE));
+            }
+            (void)gs_usb_recover_ep_in(timeout_now_us);
+        }
+
+        gs_usb_main_stage = 4U; /* TX kick */
         {
             uint8_t kick_ch;
             for (kick_ch = 0; kick_ch < GS_USB_CAN_CHANNEL_COUNT; kick_ch++) {
@@ -1724,6 +1967,7 @@ void gs_usb_run(void)
             board_led_usb_toggle();
         }
 
+        gs_usb_main_stage = 5U; /* CAN RX */
         // Process CAN RX to USB IN buffer
         if (1) {
             for (int i = 0; i < 4; i++) {
@@ -1743,7 +1987,23 @@ void gs_usb_run(void)
                 }
 
                 if (current_err_state != mcan_channels[i].error_state) {
-                    printf("[GS_USB] ch=%u ERR state changed: %u -> %u\r\n", (unsigned)i, (unsigned)mcan_channels[i].error_state, (unsigned)current_err_state);
+                    if (current_err_state >= 2U || mcan_channels[i].error_state >= 2U) {
+                        mcan_error_count_t log_ecr;
+                        mcan_get_error_counter(mcan_channels[i].base, &log_ecr);
+                        printf("[GS_USB] ch=%u ERR state: %u -> %u\r\n",
+                               (unsigned)i,
+                               (unsigned)mcan_channels[i].error_state,
+                               (unsigned)current_err_state);
+                        if (current_err_state >= 2U) {
+                            printf("[GS_USB] ch=%u counters: TEC=%u REC=%u PSR=0x%08lx DBTP=0x%08lx TDCR=0x%08lx\r\n",
+                                   (unsigned)i,
+                                   (unsigned)log_ecr.transmit_error_count,
+                                   (unsigned)log_ecr.receive_error_count,
+                                   (unsigned long)mcan_channels[i].base->PSR,
+                                   (unsigned long)mcan_channels[i].base->DBTP,
+                                   (unsigned long)mcan_channels[i].base->TDCR);
+                        }
+                    }
                     mcan_channels[i].error_state = current_err_state;
                     struct gs_host_frame err_hf = {0};
                     err_hf.channel = (uint8_t)i;
@@ -1786,17 +2046,34 @@ void gs_usb_run(void)
                     (void)enqueue_in_msg(&err_hf, 20U);
                 }
 
-                /* Bus-off 延迟恢复检查：如果处于 bus-off 超过 100ms，自动恢复 */
+                /* Allow transient error-passive states, but recover a channel
+                 * that remains passive for too long (cooldown still applies). */
+                if (current_err_state == 2U) {
+                    if (mcan_channels[i].error_passive_detect_us == 0U) {
+                        mcan_channels[i].error_passive_detect_us = gs_usb_get_time_us();
+                    } else if ((gs_usb_get_time_us() - mcan_channels[i].error_passive_detect_us) >=
+                               (GS_USB_ERROR_PASSIVE_RECOVERY_MS * 1000U)) {
+                        /* Keep error-passive state; host down/up performs recovery. */
+                        mcan_channels[i].error_passive_detect_us = gs_usb_get_time_us();
+                    }
+                } else if (current_err_state < 2U) {
+                    mcan_channels[i].error_passive_detect_us = 0U;
+                }
+                
+                /* Bus-off 后保持当前状态，不自动 deinit/reinit；由主机 down/up 恢复。 */
                 if (mcan_channels[i].busoff_detect_us != 0) {
                     uint64_t now_us = gs_usb_get_time_us();
                     if ((now_us - mcan_channels[i].busoff_detect_us) >= (GS_USB_BUSOFF_RECOVERY_DELAY_MS * 1000U)) {
-                        gs_usb_recover_channel((uint8_t)i);
+                        /* Bus-off recovery intentionally disabled; host down/up required. */
                     }
                 }
                 
                 mcan_rx_message_t rx_msg;
+                uint32_t rx_drained = 0U;
                 // Attempt to read from RX FIFO 0
-                while (status_success == mcan_read_rxfifo(mcan_channels[i].base, 0, &rx_msg)) {
+                while (rx_drained < GS_USB_RX_DRAIN_LIMIT &&
+                       status_success == mcan_read_rxfifo(mcan_channels[i].base, 0, &rx_msg)) {
+                    rx_drained++;
                     struct gs_host_frame hf = {0};
                     uint32_t frame_len;
 
@@ -1829,14 +2106,47 @@ void gs_usb_run(void)
             }
         }
         
+        gs_usb_main_stage = 6U; /* USB IN */
         // Flush IN buffer one frame at a time
         if (in_q_head != in_q_tail && !ep_in_busy) {
             uint32_t len = in_queue[in_q_tail].len;
+            int ep_status;
             memcpy(ep_in_dma_buffer, in_queue[in_q_tail].data, len);
-            in_q_tail = (in_q_tail + 1U) % IN_QUEUE_SIZE;
 
             ep_in_busy = true;
-            usbd_ep_start_write(0, GS_USB_EP_IN, ep_in_dma_buffer, len);
+            ep_in_start_us = gs_usb_get_time_us();
+            ep_in_timeout_reported = false;
+            ep_status = usbd_ep_start_write(0, GS_USB_EP_IN, ep_in_dma_buffer, len);
+            if (ep_status != 0) {
+                ep_in_busy = false;
+                ep_in_start_us = 0U;
+                ep_in_submit_fail_count++;
+            }
+        }
+
+        gs_usb_main_stage = 7U; /* heartbeat */
+        loop_now_us = gs_usb_get_time_us();
+        if (heartbeat_last_us == 0U ||
+            (loop_now_us - heartbeat_last_us) >= 1000000U) {
+            heartbeat_last_us = loop_now_us;
+            printf("[GS_USB] heartbeat loops=%lu stage=%u poll=%lu OUT=%lu paused=%u armed=%u ring=%u,%u,%u,%u busy=%u,%u,%u,%u RXQ=%lu IN=%u fail=%lu\r\n",
+                   (unsigned long)gs_usb_main_loop_count,
+                   (unsigned)gs_usb_main_stage,
+                   (unsigned long)gs_usb_poll_irq_count,
+                   (unsigned long)out_count,
+                   gs_usb_out_paused ? 1U : 0U,
+                   gs_usb_out_armed ? 1U : 0U,
+                   (unsigned)tx_ring_count(0),
+                   (unsigned)tx_ring_count(1),
+                   (unsigned)tx_ring_count(2),
+                   (unsigned)tx_ring_count(3),
+                   can_tx_states[0].busy ? 1U : 0U,
+                   can_tx_states[1].busy ? 1U : 0U,
+                   can_tx_states[2].busy ? 1U : 0U,
+                   can_tx_states[3].busy ? 1U : 0U,
+                   (unsigned long)((in_q_head + IN_QUEUE_SIZE - in_q_tail) % IN_QUEUE_SIZE),
+                   ep_in_busy ? 1U : 0U,
+                   (unsigned long)ep_in_submit_fail_count);
         }
     }
 }
