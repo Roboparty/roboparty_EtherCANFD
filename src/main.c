@@ -2,19 +2,33 @@
 // Copyright (c) 2026 wentywenty
 
 #include "board.h"
-#include "hpm_pdgo_drv.h"
+#include "hpm_common.h"
+#include "hpm_mcan_drv.h"
 #include "version.h"
+
+#if defined(MCAN_SOC_MSG_BUF_IN_AHB_RAM) && (MCAN_SOC_MSG_BUF_IN_AHB_RAM == 1)
+ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf0[MCAN_MSG_BUF_SIZE_IN_WORDS];
+ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf1[MCAN_MSG_BUF_SIZE_IN_WORDS];
+ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf2[MCAN_MSG_BUF_SIZE_IN_WORDS];
+ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf3[MCAN_MSG_BUF_SIZE_IN_WORDS];
+#endif
+
+#if ENABLE_ETHERCAT
+#include "hpm_pdgo_drv.h"
 
 /* 1 = WKUP pressed runs GS_USB;  0 = WKUP pressed runs EtherCAT */
 #define WKUP_GS_USB_MODE 1
+#endif
 
 extern void gs_usb_run(void);
+#if ENABLE_ETHERCAT
 extern void ecat_run(void);
 
 static bool is_wkup_pin_pressed(void)
 {
     return (HPM_PDGO->PIN_STS & PDGO_PIN_STS_WKUP_MASK) == 0U;
 }
+#endif
 
 int main(void)
 {
@@ -35,6 +49,7 @@ int main(void)
     printf("\n==========================================\n");
     printf("=== ethercanfd v" FIRMWARE_VERSION " (" BUILD_DATE ") ===\n");
 
+#if ENABLE_ETHERCAT
 #if WKUP_GS_USB_MODE
     if (is_wkup_pin_pressed()) {
         printf("[BOOT] WKUP released  -> GS_USB mode\n");
@@ -55,6 +70,11 @@ int main(void)
         printf("==========================================\n\n");
         gs_usb_run();
     }
+#endif
+#else
+    printf("[BOOT] USB-only build -> GS_USB mode\n");
+    printf("==========================================\n\n");
+    gs_usb_run();
 #endif
 
     while (1) { }

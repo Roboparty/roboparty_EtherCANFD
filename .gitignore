@@ -1,6 +1,7 @@
 *.pyc
 build/
 env.ps1
+env.sh
 *bak.xlsx
 test/
 *.log

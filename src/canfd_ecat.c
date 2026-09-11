@@ -52,12 +52,11 @@ static const uint8_t s_config_subindex_count = 5U;
 static const uint8_t s_data_control_subindex_count = 2U;
 
 #if defined(MCAN_SOC_MSG_BUF_IN_AHB_RAM) && (MCAN_SOC_MSG_BUF_IN_AHB_RAM == 1)
-ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf0[MCAN_MSG_BUF_SIZE_IN_WORDS];
-ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf1[MCAN_MSG_BUF_SIZE_IN_WORDS];
-ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf2[MCAN_MSG_BUF_SIZE_IN_WORDS];
-ATTR_PLACE_AT(".ahb_sram") uint32_t s_mcan_msg_buf3[MCAN_MSG_BUF_SIZE_IN_WORDS];
+extern uint32_t s_mcan_msg_buf0[MCAN_MSG_BUF_SIZE_IN_WORDS];
+extern uint32_t s_mcan_msg_buf1[MCAN_MSG_BUF_SIZE_IN_WORDS];
+extern uint32_t s_mcan_msg_buf2[MCAN_MSG_BUF_SIZE_IN_WORDS];
+extern uint32_t s_mcan_msg_buf3[MCAN_MSG_BUF_SIZE_IN_WORDS];
 #endif
-
 
 extern TOBJ7000 Can0TxFrame0x7000;
 extern TOBJ7010 Can1TxFrame0x7010;

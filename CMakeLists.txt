@@ -1,14 +1,34 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 wentywenty
 
-# ---- Toolchain ----
-set(ENV{GNURISCV_TOOLCHAIN_PATH} "$ENV{HPM_SDK_BASE}/../toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win")
-set(ENV{HPM_SDK_TOOLCHAIN_VARIANT} "")
-
 cmake_minimum_required(VERSION 3.13)
 
+# ---- Toolchain ----
+if(NOT DEFINED ENV{GNURISCV_TOOLCHAIN_PATH} OR "$ENV{GNURISCV_TOOLCHAIN_PATH}" STREQUAL "")
+    if(CMAKE_HOST_WIN32)
+        set(_default_toolchain "$ENV{HPM_SDK_BASE}/../toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-win")
+    elseif(CMAKE_HOST_UNIX)
+        set(_default_toolchain "$ENV{HPM_SDK_BASE}/../toolchains/rv32imac_zicsr_zifencei_multilib_b_ext-linux")
+        if(NOT EXISTS "${_default_toolchain}/bin/riscv32-unknown-elf-gcc"
+           AND EXISTS "$ENV{HPM_SDK_BASE}/../toolchains/rv32imac_zicsr_zifencei_multilib_b_ext/bin/riscv32-unknown-elf-gcc")
+            set(_default_toolchain "$ENV{HPM_SDK_BASE}/../toolchains/rv32imac_zicsr_zifencei_multilib_b_ext")
+        endif()
+    else()
+        message(FATAL_ERROR "Unsupported build host: ${CMAKE_HOST_SYSTEM_NAME}")
+    endif()
+
+    set(ENV{GNURISCV_TOOLCHAIN_PATH} "${_default_toolchain}")
+endif()
+
+string(STRIP "$ENV{HPM_SDK_TOOLCHAIN_VARIANT}" _toolchain_variant)
+set(ENV{HPM_SDK_TOOLCHAIN_VARIANT} "${_toolchain_variant}")
+
 # ---- Project settings ----
-set(CONFIG_EEPROM_EMULATION 1)
+option(ENABLE_ETHERCAT "Build EtherCAT support" OFF)
+
+if(ENABLE_ETHERCAT)
+    set(CONFIG_EEPROM_EMULATION 1)
+endif()
 set(CONFIG_CHERRYUSB_DEVICE 1)
 set(CONFIG_USB_HS 1)
 set(CONFIG_CHERRYUSB 1)
@@ -28,19 +48,8 @@ find_package(hpm-sdk REQUIRED HINTS $ENV)
 
 project(ethercanfd)
 
-# ---- Version (from git tag, fallback 0.0.0) ----
-execute_process(
-    COMMAND git describe --tags --always
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_DESCRIBE
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(GIT_DESCRIBE)
-    string(REGEX REPLACE "^v" "" FIRMWARE_VERSION "${GIT_DESCRIBE}")
-else()
-    set(FIRMWARE_VERSION "0.0.0")
-endif()
+# ---- Release version ----
+set(FIRMWARE_VERSION "1.0.6" CACHE STRING "Firmware semantic version")
 
 string(TIMESTAMP BUILD_DATE "%Y%m%d")
 
@@ -72,26 +81,34 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in ${CMAKE_CURRENT_BINA
 # ---- Global compile definitions ----
 add_compile_definitions(
     FW_BCD_DEVICE=${FW_BCD_DEVICE}
-    REVISION_NUMBER=${FW_REVISION}
 )
+if(ENABLE_ETHERCAT)
+    add_compile_definitions(
+        ENABLE_ETHERCAT=1
+        REVISION_NUMBER=${FW_REVISION}
+    )
+else()
+    add_compile_definitions(ENABLE_ETHERCAT=0)
+endif()
 
 # ---- Sources ----
-add_subdirectory(SSC)
+if(ENABLE_ETHERCAT)
+    add_subdirectory(SSC)
 
-# Suppress SSC-generated null-character warnings in user code
+    set(ECAT_PORT_DIR "$ENV{HPM_SDK_BASE}/samples/ethercat/port")
+    sdk_inc(${ECAT_PORT_DIR})
+    sdk_src(${ECAT_PORT_DIR}/hpm_ecat_hw.c)
+    sdk_src(${ECAT_PORT_DIR}/hpm_ecat_phy.c)
+    if(CONFIG_EEPROM_EMULATION)
+        sdk_src(${ECAT_PORT_DIR}/hpm_ecat_e2p_emulation.c)
+    endif()
 
-set(ECAT_PORT_DIR "$ENV{HPM_SDK_BASE}/samples/ethercat/port")
-sdk_inc(${ECAT_PORT_DIR})
-sdk_src(${ECAT_PORT_DIR}/hpm_ecat_hw.c)
-sdk_src(${ECAT_PORT_DIR}/hpm_ecat_phy.c)
-if(CONFIG_EEPROM_EMULATION)
-    sdk_src(${ECAT_PORT_DIR}/hpm_ecat_e2p_emulation.c)
+    sdk_src(src/EtherCANFD.c)
+    sdk_app_src(src/canfd_ecat.c)
 endif()
 
 sdk_inc(src)
 sdk_inc(${CMAKE_CURRENT_BINARY_DIR}/generated)
-sdk_src(src/EtherCANFD.c)
-sdk_app_src(src/canfd_ecat.c)
 sdk_app_src(src/gs_usb.c)
 sdk_app_src(src/main.c)
 

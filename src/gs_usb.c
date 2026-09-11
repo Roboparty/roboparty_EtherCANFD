@@ -282,8 +282,10 @@ static const char *gs_usb_string_descriptor_callback(uint8_t speed, uint8_t inde
 
 #define GS_USB_CAN_CHANNEL_COUNT 4U
 #define TX_RING_SIZE_PER_CH      128U
-#define TX_RING_HIGH_WATERMARK   ((TX_RING_SIZE_PER_CH * 9U) / 10U)
+#define TX_RING_HIGH_WATERMARK   (TX_RING_SIZE_PER_CH - GS_USB_MAX_PACKET_SIZE / 20U)
 #define TX_RING_LOW_WATERMARK    ((TX_RING_SIZE_PER_CH * 3U) / 10U)
+#define ECHO_QUEUE_HIGH_WATERMARK 32U
+#define ECHO_QUEUE_LOW_WATERMARK  16U
 #define GS_USB_TX_TIMEOUT_US     20000U
 #define GS_USB_EP_IN_TIMEOUT_US  500000U /* Recover an IN transfer with no completion after 500 ms */
 #define GS_USB_EP_IN_FLUSH_TIMEOUT_US 2000U /* Never wait forever for ENDPTFLUSH */
@@ -357,6 +359,8 @@ struct can_tx_state {
     volatile bool busy;
     volatile uint32_t fifo_index;
     volatile uint64_t start_us;
+    volatile bool cancel_requested;
+    volatile bool halted;
     bool inflight_valid;
     struct tx_ring_item inflight_item;
     uint8_t marker;
@@ -408,6 +412,17 @@ struct in_msg {
 static struct in_msg in_queue[IN_QUEUE_SIZE];
 static volatile uint32_t in_q_head = 0;
 static volatile uint32_t in_q_tail = 0;
+static struct in_msg echo_queue[IN_QUEUE_SIZE];
+static volatile uint32_t echo_q_head = 0;
+static volatile uint32_t echo_q_tail = 0;
+static volatile uint32_t in_rx_dropped = 0;
+static volatile uint32_t echo_backpressure = 0;
+enum gs_usb_in_queue_kind {
+    GS_USB_IN_QUEUE_NONE = 0,
+    GS_USB_IN_QUEUE_ECHO,
+    GS_USB_IN_QUEUE_RX,
+};
+static volatile uint8_t ep_in_queue_kind = GS_USB_IN_QUEUE_NONE;
 static struct tx_ring tx_rings[GS_USB_CAN_CHANNEL_COUNT];
 static struct can_tx_state can_tx_states[GS_USB_CAN_CHANNEL_COUNT];
 static uint8_t tx_marker_seq = 1U;
@@ -417,6 +432,8 @@ static void gs_usb_resume_out_if_possible(void);
 static void gs_usb_service_tx_timeouts(void);
 static void gs_usb_service_tx_complete_poll(void);
 static void gs_usb_recover_channel(uint8_t ch);
+static void gs_usb_service_in(void);
+static uint64_t gs_usb_get_time_us(void);
 
 static uint32_t gs_usb_irq_save(void)
 {
@@ -433,20 +450,73 @@ static void gs_usb_irq_restore(uint32_t level)
 static bool enqueue_in_msg(const void *data, uint32_t len)
 {
     uint32_t level = gs_usb_irq_save();
-    uint32_t next = (in_q_head + 1U) % IN_QUEUE_SIZE;
-    if (len == 0U || len > sizeof(in_queue[0].data)) {
+    uint32_t echo_id;
+    struct in_msg *queue;
+    volatile uint32_t *head;
+    volatile uint32_t *tail;
+    uint32_t next;
+    bool is_echo;
+
+    if (len < 12U || len > sizeof(in_queue[0].data)) {
         gs_usb_irq_restore(level);
         return false;
     }
-    if (next == in_q_tail) {
+
+    memcpy(&echo_id, data, sizeof(echo_id));
+    is_echo = echo_id != 0xFFFFFFFFU;
+    queue = is_echo ? echo_queue : in_queue;
+    head = is_echo ? &echo_q_head : &in_q_head;
+    tail = is_echo ? &echo_q_tail : &in_q_tail;
+    next = (*head + 1U) % IN_QUEUE_SIZE;
+    if (next == *tail) {
+        if (is_echo) {
+            echo_backpressure++;
+        } else {
+            in_rx_dropped++;
+        }
         gs_usb_irq_restore(level);
         return false;
     }
-    memcpy(in_queue[in_q_head].data, data, len);
-    in_queue[in_q_head].len = len;
-    in_q_head = next;
+
+    memcpy(queue[*head].data, data, len);
+    queue[*head].len = len;
+    *head = next;
     gs_usb_irq_restore(level);
     return true;
+}
+
+static uint32_t gs_usb_queue_depth(volatile uint32_t head, volatile uint32_t tail)
+{
+    return (head + IN_QUEUE_SIZE - tail) % IN_QUEUE_SIZE;
+}
+
+static void gs_usb_service_in(void)
+{
+    uint32_t level = gs_usb_irq_save();
+
+    if (!ep_in_busy && (echo_q_head != echo_q_tail || in_q_head != in_q_tail)) {
+        bool use_echo = echo_q_head != echo_q_tail;
+        struct in_msg *queue = use_echo ? echo_queue : in_queue;
+        uint32_t tail = use_echo ? echo_q_tail : in_q_tail;
+        uint32_t len = queue[tail].len;
+        int ep_status;
+
+        memcpy(ep_in_dma_buffer, queue[tail].data, len);
+        ep_in_busy = true;
+        ep_in_queue_kind = use_echo ? GS_USB_IN_QUEUE_ECHO : GS_USB_IN_QUEUE_RX;
+        ep_in_start_us = gs_usb_get_time_us();
+        ep_in_timeout_reported = false;
+        ep_status = usbd_ep_start_write(0, GS_USB_EP_IN, ep_in_dma_buffer, len);
+        if (ep_status != 0) {
+            ep_in_busy = false;
+            ep_in_queue_kind = GS_USB_IN_QUEUE_NONE;
+            ep_in_start_us = 0U;
+            ep_in_submit_fail_count++;
+        }
+    }
+
+    gs_usb_irq_restore(level);
+    gs_usb_resume_out_if_possible();
 }
 
 static uint64_t gs_usb_get_time_us(void)
@@ -582,6 +652,33 @@ static bool tx_ring_pop(uint8_t ch, struct tx_ring_item *item)
     return true;
 }
 
+static bool tx_ring_peek(uint8_t ch, struct tx_ring_item *item)
+{
+    struct tx_ring *ring = &tx_rings[ch];
+    uint32_t level = gs_usb_irq_save();
+
+    if (ring->count == 0U) {
+        gs_usb_irq_restore(level);
+        return false;
+    }
+
+    *item = ring->items[ring->tail];
+    gs_usb_irq_restore(level);
+    return true;
+}
+
+static void tx_ring_drop_head(uint8_t ch)
+{
+    struct tx_ring *ring = &tx_rings[ch];
+    uint32_t level = gs_usb_irq_save();
+
+    if (ring->count != 0U) {
+        ring->tail = (uint16_t)((ring->tail + 1U) % TX_RING_SIZE_PER_CH);
+        ring->count--;
+    }
+    gs_usb_irq_restore(level);
+}
+
 static uint16_t tx_ring_count(uint8_t ch)
 {
     uint32_t level = gs_usb_irq_save();
@@ -594,6 +691,10 @@ static bool gs_usb_should_pause_out(void)
 {
     uint8_t ch;
 
+    if (gs_usb_queue_depth(echo_q_head, echo_q_tail) >= ECHO_QUEUE_HIGH_WATERMARK) {
+        return true;
+    }
+
     for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
         if (tx_ring_count(ch) >= TX_RING_HIGH_WATERMARK) {
             return true;
@@ -605,6 +706,10 @@ static bool gs_usb_should_pause_out(void)
 static bool gs_usb_can_resume_out(void)
 {
     uint8_t ch;
+
+    if (gs_usb_queue_depth(echo_q_head, echo_q_tail) > ECHO_QUEUE_LOW_WATERMARK) {
+        return false;
+    }
 
     for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
         if (tx_ring_count(ch) > TX_RING_LOW_WATERMARK) {
@@ -659,38 +764,65 @@ static void gs_usb_flush_tx_ring(uint8_t ch)
     }
 }
 
-static void gs_usb_finish_tx(uint8_t ch, bool success)
+static bool gs_usb_finish_tx(uint8_t ch, bool success,
+                             uint32_t expected_fifo_index,
+                             uint8_t expected_marker)
 {
+    struct tx_ring_item item;
+    bool loopback;
+    uint32_t level;
+
     if (ch >= GS_USB_CAN_CHANNEL_COUNT) {
-        return;
+        return false;
     }
 
-    if (can_tx_states[ch].fifo_index < 32U) {
+    level = gs_usb_irq_save();
+    if (can_tx_states[ch].halted || !can_tx_states[ch].busy ||
+        !can_tx_states[ch].inflight_valid ||
+        can_tx_states[ch].fifo_index != expected_fifo_index ||
+        can_tx_states[ch].marker != expected_marker) {
+        gs_usb_irq_restore(level);
+        return false;
+    }
+
+    if (expected_fifo_index < 32U &&
+        mcan_is_transmit_request_pending(mcan_channels[ch].base, expected_fifo_index)) {
+        gs_usb_irq_restore(level);
+        return false;
+    }
+
+    item = can_tx_states[ch].inflight_item;
+    if (!enqueue_in_msg(&item.host_frame, item.frame_len)) {
+        gs_usb_irq_restore(level);
+        return false;
+    }
+
+    if (expected_fifo_index < 32U) {
         mcan_disable_txbuf_transmission_interrupt(mcan_channels[ch].base,
-                                                  (1UL << can_tx_states[ch].fifo_index));
+                                                  (1UL << expected_fifo_index));
         mcan_disable_txbuf_cancel_finish_interrupt(mcan_channels[ch].base,
-                                                   (1UL << can_tx_states[ch].fifo_index));
+                                                   (1UL << expected_fifo_index));
     }
 
-    if (can_tx_states[ch].inflight_valid) {
-        (void)enqueue_in_msg(&can_tx_states[ch].inflight_item.host_frame,
-                             can_tx_states[ch].inflight_item.frame_len);
-        if (success && can_tx_states[ch].inflight_item.loopback) {
-            struct gs_host_frame rx_echo;
-            memcpy(&rx_echo, &can_tx_states[ch].inflight_item.host_frame, can_tx_states[ch].inflight_item.frame_len);
-            rx_echo.echo_id = 0xFFFFFFFFU;
-            (void)enqueue_in_msg(&rx_echo, can_tx_states[ch].inflight_item.frame_len);
-        }
-    }
-
+    loopback = item.loopback;
     can_tx_states[ch].busy = false;
     can_tx_states[ch].fifo_index = 0;
     can_tx_states[ch].start_us = 0U;
+    can_tx_states[ch].cancel_requested = false;
     can_tx_states[ch].marker = 0U;
     can_tx_states[ch].inflight_valid = false;
 
+    if (success && loopback) {
+        struct gs_host_frame rx_echo;
+        memcpy(&rx_echo, &item.host_frame, item.frame_len);
+        rx_echo.echo_id = 0xFFFFFFFFU;
+        (void)enqueue_in_msg(&rx_echo, item.frame_len);
+    }
+    gs_usb_irq_restore(level);
+
     gs_usb_kick_can_tx(ch);
     gs_usb_resume_out_if_possible();
+    return true;
 }
 
 static void gs_usb_kick_can_tx(uint8_t ch)
@@ -698,13 +830,21 @@ static void gs_usb_kick_can_tx(uint8_t ch)
     struct tx_ring_item item;
     mcan_tx_frame_t tx_frame = {0};
     uint32_t fifo_index = 0;
+    uint32_t level;
     hpm_stat_t tx_stat;
 
-    if (ch >= GS_USB_CAN_CHANNEL_COUNT || can_tx_states[ch].busy || !mcan_channels[ch].is_open) {
+    if (ch >= GS_USB_CAN_CHANNEL_COUNT) {
         return;
     }
 
-    if (!tx_ring_pop(ch, &item)) {
+    level = gs_usb_irq_save();
+    if (can_tx_states[ch].halted || can_tx_states[ch].busy || !mcan_channels[ch].is_open) {
+        gs_usb_irq_restore(level);
+        return;
+    }
+
+    if (!tx_ring_peek(ch, &item)) {
+        gs_usb_irq_restore(level);
         return;
     }
 
@@ -738,13 +878,15 @@ static void gs_usb_kick_can_tx(uint8_t ch)
                        (unsigned)ch,
                        (long)tx_stat,
                        (unsigned)tx_ring_count(ch));
-            (void)tx_ring_push(ch, &item);
+            gs_usb_irq_restore(level);
             return;
         }
 
+        tx_ring_drop_head(ch);
         can_tx_states[ch].busy = true;
         can_tx_states[ch].fifo_index = fifo_index;
         can_tx_states[ch].start_us = gs_usb_get_time_us();
+        can_tx_states[ch].cancel_requested = false;
         s_gs_can_led_ticks[ch] = GS_USB_LED_ON_TICKS;
         can_tx_states[ch].marker = tx_marker_seq++;
         can_tx_states[ch].inflight_item = item;
@@ -755,7 +897,12 @@ static void gs_usb_kick_can_tx(uint8_t ch)
                    (unsigned)ch,
                    (unsigned long)fifo_index,
                    (unsigned)tx_ring_count(ch));
+    } else {
+        /* Host-originated CAN error frames are invalid TX requests. */
+        tx_ring_drop_head(ch);
+        out_drop++;
     }
+    gs_usb_irq_restore(level);
 }
 
 static bool is_in_noncache_region(const void *p, uint32_t size)
@@ -885,20 +1032,56 @@ void gs_usb_ep_out_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 /* EP IN Callback (MCU -> PC) */
 void gs_usb_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
+    uint32_t level;
+
     (void)busid;
     (void)ep;
     (void)nbytes;
 
     /* The queue entry remains owned by USB DMA until this real completion
      * callback.  Never release it merely because a software timer expired. */
-    if (ep_in_busy && in_q_head != in_q_tail) {
+    level = gs_usb_irq_save();
+    if (ep_in_busy && ep_in_queue_kind == GS_USB_IN_QUEUE_ECHO &&
+        echo_q_head != echo_q_tail) {
+        echo_q_tail = (echo_q_tail + 1U) % IN_QUEUE_SIZE;
+    } else if (ep_in_busy && ep_in_queue_kind == GS_USB_IN_QUEUE_RX &&
+               in_q_head != in_q_tail) {
         in_q_tail = (in_q_tail + 1U) % IN_QUEUE_SIZE;
     }
     ep_in_busy = false;
+    ep_in_queue_kind = GS_USB_IN_QUEUE_NONE;
     ep_in_start_us = 0U;
     ep_in_timeout_reported = false;
     ep_in_recovery_streak = 0U;
     ep_in_persistent_reported = false;
+    gs_usb_irq_restore(level);
+}
+
+static void gs_usb_stop_and_clear_channel(uint8_t ch)
+{
+    if (ch >= GS_USB_CAN_CHANNEL_COUNT) {
+        return;
+    }
+
+    intc_m_disable_irq(mcan_irqs[ch]);
+    if (mcan_channels[ch].is_open) {
+        mcan_deinit(mcan_channels[ch].base);
+    }
+    mcan_channels[ch].is_open = false;
+    mcan_channels[ch].error_state = 0;
+    mcan_channels[ch].busoff_detect_us = 0U;
+    mcan_channels[ch].busoff_recovery_us = 0U;
+    mcan_channels[ch].error_passive_detect_us = 0U;
+    tx_rings[ch].head = 0U;
+    tx_rings[ch].tail = 0U;
+    tx_rings[ch].count = 0U;
+    can_tx_states[ch].busy = false;
+    can_tx_states[ch].fifo_index = 0U;
+    can_tx_states[ch].start_us = 0U;
+    can_tx_states[ch].cancel_requested = false;
+    can_tx_states[ch].halted = false;
+    can_tx_states[ch].marker = 0U;
+    can_tx_states[ch].inflight_valid = false;
 }
 
 static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
@@ -917,6 +1100,7 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
         gs_usb_out_paused = false;
         gs_usb_out_armed = false;
         ep_in_busy = false;
+        ep_in_queue_kind = GS_USB_IN_QUEUE_NONE;
         ep_in_start_us = 0U;
         ep_in_timeout_reported = false;
         ep_in_last_recovery_us = 0U;
@@ -924,17 +1108,10 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
         ep_in_persistent_reported = false;
         in_q_head = 0;
         in_q_tail = 0;
+        echo_q_head = 0;
+        echo_q_tail = 0;
         for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
-            tx_rings[ch].head = 0;
-            tx_rings[ch].tail = 0;
-            tx_rings[ch].count = 0;
-            can_tx_states[ch].busy = false;
-            can_tx_states[ch].fifo_index = 0;
-            can_tx_states[ch].start_us = 0U;
-            can_tx_states[ch].marker = 0U;
-            can_tx_states[ch].inflight_valid = false;
-            mcan_channels[ch].busoff_detect_us = 0;
-            mcan_channels[ch].busoff_recovery_us = 0;
+            gs_usb_stop_and_clear_channel(ch);
         }
         break;
     case USBD_EVENT_SUSPEND:
@@ -958,6 +1135,7 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
         gs_usb_out_paused = false;
         gs_usb_out_armed = false;
         ep_in_busy = false;
+        ep_in_queue_kind = GS_USB_IN_QUEUE_NONE;
         ep_in_start_us = 0U;
         ep_in_timeout_reported = false;
         ep_in_last_recovery_us = 0U;
@@ -965,17 +1143,10 @@ static void gs_usb_bus_event_handler(uint8_t busid, uint8_t event)
         ep_in_persistent_reported = false;
         in_q_head = 0;
         in_q_tail = 0;
+        echo_q_head = 0;
+        echo_q_tail = 0;
         for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
-            tx_rings[ch].head = 0;
-            tx_rings[ch].tail = 0;
-            tx_rings[ch].count = 0;
-            can_tx_states[ch].busy = false;
-            can_tx_states[ch].fifo_index = 0;
-            can_tx_states[ch].start_us = 0U;
-            can_tx_states[ch].marker = 0U;
-            can_tx_states[ch].inflight_valid = false;
-            mcan_channels[ch].busoff_detect_us = 0;
-            mcan_channels[ch].busoff_recovery_us = 0;
+            gs_usb_stop_and_clear_channel(ch);
         }
         break;
     default:
@@ -993,6 +1164,10 @@ void gs_usb_notify_handler(uint8_t busid, uint8_t event, void *arg)
 static void gs_usb_handle_can_tx_irq(uint8_t ch)
 {
     uint32_t flags;
+    uint32_t fifo_index;
+    uint32_t fifo_mask;
+    uint8_t marker;
+    uint32_t level;
 
     if (ch >= GS_USB_CAN_CHANNEL_COUNT) {
         return;
@@ -1011,37 +1186,63 @@ static void gs_usb_handle_can_tx_irq(uint8_t ch)
 
     mcan_clear_interrupt_flags(mcan_channels[ch].base, flags);
 
-    if ((flags & MCAN_INT_TX_CANCEL_FINISHED) != 0U) {
-        gs_usb_finish_tx(ch, false);
-    } else if ((flags & MCAN_INT_TX_COMPLETED) != 0U) {
-        gs_usb_finish_tx(ch, true);
+    level = gs_usb_irq_save();
+    if (!can_tx_states[ch].busy || !can_tx_states[ch].inflight_valid ||
+        can_tx_states[ch].fifo_index >= 32U) {
+        gs_usb_irq_restore(level);
+        return;
+    }
+    fifo_index = can_tx_states[ch].fifo_index;
+    marker = can_tx_states[ch].marker;
+    fifo_mask = 1UL << fifo_index;
+    gs_usb_irq_restore(level);
+
+    if ((flags & MCAN_INT_TX_COMPLETED) != 0U &&
+        (mcan_channels[ch].base->TXBTO & fifo_mask) != 0U) {
+        (void)gs_usb_finish_tx(ch, true, fifo_index, marker);
+    } else if ((flags & MCAN_INT_TX_CANCEL_FINISHED) != 0U &&
+               (mcan_channels[ch].base->TXBCF & fifo_mask) != 0U) {
+        (void)gs_usb_finish_tx(ch, false, fifo_index, marker);
     }
 }
 
 static void gs_usb_service_tx_timeouts(void)
 {
     uint8_t ch;
-    uint64_t now_us = gs_usb_get_time_us();
 
     for (ch = 0; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
         mcan_protocol_status_t psr;
         mcan_error_count_t ecr;
+        uint64_t now_us;
+        uint64_t start_us;
         uint32_t fifo_index;
-        uint8_t err_state;
+        uint32_t fifo_mask;
+        uint8_t marker;
+        bool cancel_requested;
+        uint32_t level;
 
-        if (!can_tx_states[ch].busy || can_tx_states[ch].start_us == 0U) {
+        level = gs_usb_irq_save();
+        if (can_tx_states[ch].halted || !can_tx_states[ch].busy ||
+            !can_tx_states[ch].inflight_valid || can_tx_states[ch].start_us == 0U ||
+            can_tx_states[ch].fifo_index >= 32U) {
+            gs_usb_irq_restore(level);
             continue;
         }
-
-        if ((now_us - can_tx_states[ch].start_us) < GS_USB_TX_TIMEOUT_US) {
-            continue;
-        }
-
+        start_us = can_tx_states[ch].start_us;
         fifo_index = can_tx_states[ch].fifo_index;
+        marker = can_tx_states[ch].marker;
+        cancel_requested = can_tx_states[ch].cancel_requested;
+        gs_usb_irq_restore(level);
+
+        now_us = gs_usb_get_time_us();
+        if (now_us < start_us || (now_us - start_us) < GS_USB_TX_TIMEOUT_US) {
+            continue;
+        }
+
+        fifo_mask = 1UL << fifo_index;
         if (!mcan_is_transmit_request_pending(mcan_channels[ch].base, fifo_index)) {
-            if (can_tx_states[ch].busy) {
-                gs_usb_finish_tx(ch, false);
-            }
+            bool success = (mcan_channels[ch].base->TXBTO & fifo_mask) != 0U;
+            (void)gs_usb_finish_tx(ch, success, fifo_index, marker);
             continue;
         }
 
@@ -1057,30 +1258,32 @@ static void gs_usb_service_tx_timeouts(void)
                    (unsigned)ecr.transmit_error_count,
                    (unsigned)ecr.receive_error_count);
 
-        err_state = gs_usb_get_channel_error_state(ch);
-        if (err_state >= 2U) {
-            if (fifo_index < 32U) {
-                mcan_cancel_tx_buf_send_request(mcan_channels[ch].base, fifo_index);
+        if ((now_us - start_us) >= (GS_USB_TX_TIMEOUT_US * 2U)) {
+            level = gs_usb_irq_save();
+            if (can_tx_states[ch].busy && can_tx_states[ch].inflight_valid &&
+                can_tx_states[ch].fifo_index == fifo_index &&
+                can_tx_states[ch].marker == marker &&
+                mcan_is_transmit_request_pending(mcan_channels[ch].base, fifo_index)) {
+                can_tx_states[ch].halted = true;
+                mcan_enter_init_mode(mcan_channels[ch].base);
+                printf("[GS_USB] TX halted ch=%u fifo=%lu age_us=%llu; host restart required\r\n",
+                       (unsigned)ch, (unsigned long)fifo_index,
+                       (unsigned long long)(now_us - start_us));
             }
-            gs_usb_flush_tx_ring(ch);
-            gs_usb_finish_tx(ch, false);
+            gs_usb_irq_restore(level);
             continue;
         }
 
-        if ((now_us - can_tx_states[ch].start_us) > (GS_USB_TX_TIMEOUT_US * 2U)) {
-            /* 二次超时：先取消硬件 TX buffer 再结束，防止 TX FIFO 槽位泄漏 */
-            if (fifo_index < 32U) {
+        if (!cancel_requested) {
+            level = gs_usb_irq_save();
+            if (can_tx_states[ch].busy && can_tx_states[ch].inflight_valid &&
+                can_tx_states[ch].fifo_index == fifo_index &&
+                can_tx_states[ch].marker == marker) {
+                can_tx_states[ch].cancel_requested = true;
                 mcan_cancel_tx_buf_send_request(mcan_channels[ch].base, fifo_index);
             }
-            gs_usb_finish_tx(ch, false);
-            continue;
+            gs_usb_irq_restore(level);
         }
-
-        if (fifo_index < 32U) {
-            mcan_cancel_tx_buf_send_request(mcan_channels[ch].base, fifo_index);
-        }
-
-        can_tx_states[ch].start_us = now_us;
     }
 }
 
@@ -1125,6 +1328,8 @@ static void gs_usb_recover_channel(uint8_t ch)
         can_tx_states[ch].busy = false;
         can_tx_states[ch].fifo_index = 0;
         can_tx_states[ch].start_us = 0U;
+        can_tx_states[ch].cancel_requested = false;
+        can_tx_states[ch].halted = false;
         can_tx_states[ch].marker = 0U;
         can_tx_states[ch].inflight_valid = false;
     }
@@ -1230,9 +1435,25 @@ static void gs_usb_service_tx_complete_poll(void)
             continue;
         }
 
-        /* Drain all pending TX Event FIFO entries in one pass to prevent overflow.
-         * Do not break after completing the in-flight frame: older/stale events
-         * may still be pending and must also be consumed. */
+        {
+            uint32_t level = gs_usb_irq_save();
+            bool valid = !can_tx_states[ch].halted && can_tx_states[ch].busy &&
+                         can_tx_states[ch].inflight_valid &&
+                         can_tx_states[ch].fifo_index < 32U;
+            uint32_t fifo_index = can_tx_states[ch].fifo_index;
+            uint8_t marker = can_tx_states[ch].marker;
+            uint32_t fifo_mask = valid ? (1UL << fifo_index) : 0U;
+            gs_usb_irq_restore(level);
+
+            if (valid && (mcan_channels[ch].base->TXBTO & fifo_mask) != 0U) {
+                (void)gs_usb_finish_tx(ch, true, fifo_index, marker);
+            } else if (valid && (mcan_channels[ch].base->TXBCF & fifo_mask) != 0U) {
+                (void)gs_usb_finish_tx(ch, false, fifo_index, marker);
+            }
+        }
+
+        /* Status bits for the current slot are authoritative. Event markers
+         * are only drained because an 8-bit marker can wrap and match stale data. */
         uint32_t tx_evt_drained = 0U;
         while (tx_evt_drained < GS_USB_TX_EVT_DRAIN_LIMIT &&
                mcan_read_tx_evt_fifo(mcan_channels[ch].base, &tx_evt) == status_success) {
@@ -1242,11 +1463,6 @@ static void gs_usb_service_tx_complete_poll(void)
                        (unsigned)tx_evt.message_marker,
                        (unsigned)tx_evt.event_type,
                        (unsigned long)can_tx_states[ch].fifo_index);
-
-            if (can_tx_states[ch].busy && can_tx_states[ch].inflight_valid &&
-                tx_evt.message_marker == can_tx_states[ch].marker) {
-                gs_usb_finish_tx(ch, true);
-            }
         }
     }
 }
@@ -1425,19 +1641,7 @@ bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CA
                 struct gs_device_mode *mode_req = (struct gs_device_mode *)(*data);
                 mcan_channels[val].mode_flags = mode_req->flags;
                 if (mode_req->mode == 0) { // reset
-                    mcan_deinit(mcan_channels[val].base);
-                    intc_m_disable_irq(mcan_irqs[val]);
-                    mcan_channels[val].is_open = false;
-                    mcan_channels[val].error_state = 0;
-                    mcan_channels[val].busoff_detect_us = 0;
-                    tx_rings[val].head = 0;
-                    tx_rings[val].tail = 0;
-                    tx_rings[val].count = 0;
-                    can_tx_states[val].busy = false;
-                    can_tx_states[val].fifo_index = 0;
-                    can_tx_states[val].start_us = 0U;
-                    can_tx_states[val].marker = 0U;
-                    can_tx_states[val].inflight_valid = false;
+                    gs_usb_stop_and_clear_channel((uint8_t)val);
                 } else { // start
                     if (mcan_channels[val].is_open) {
                         *len = 0;
@@ -1532,6 +1736,8 @@ bt_const.feature = GS_CAN_FEATURE_LOOP_BACK | GS_CAN_FEATURE_LISTEN_ONLY | GS_CA
                         can_tx_states[val].busy = false;
                         can_tx_states[val].fifo_index = 0;
                         can_tx_states[val].start_us = 0U;
+                        can_tx_states[val].cancel_requested = false;
+                        can_tx_states[val].halted = false;
                         can_tx_states[val].marker = 0U;
                         can_tx_states[val].inflight_valid = false;
                         mcan_channels[val].is_open = true;
@@ -1819,7 +2025,7 @@ void gs_usb_run(void)
             (loop_now_us - heartbeat_last_us) >= 1000000U) {
             heartbeat_last_us = loop_now_us;
             USB_Type *heartbeat_usb = (USB_Type *)HPM_USB0;
-            printf("[GS_USB] heartbeat pre-usb loops=%lu prev_stage=%u cfg=%u conn=%u USBSTS=0x%08lx poll=%lu OUT=%lu paused=%u armed=%u ring=%u,%u,%u,%u busy=%u,%u,%u,%u RXQ=%lu IN=%u fail=%lu\r\n",
+            printf("[GS_USB] heartbeat pre-usb loops=%lu prev_stage=%u cfg=%u conn=%u USBSTS=0x%08lx poll=%lu OUT=%lu paused=%u armed=%u ring=%u,%u,%u,%u busy=%u,%u,%u,%u EQ=%lu RXQ=%lu IN=%u fail=%lu echo_bp=%lu rx_drop=%lu\r\n",
                    (unsigned long)gs_usb_main_loop_count,
                    (unsigned)previous_stage,
                    gs_usb_configured ? 1U : 0U,
@@ -1837,9 +2043,12 @@ void gs_usb_run(void)
                    can_tx_states[1].busy ? 1U : 0U,
                    can_tx_states[2].busy ? 1U : 0U,
                    can_tx_states[3].busy ? 1U : 0U,
-                   (unsigned long)((in_q_head + IN_QUEUE_SIZE - in_q_tail) % IN_QUEUE_SIZE),
+                   (unsigned long)gs_usb_queue_depth(echo_q_head, echo_q_tail),
+                   (unsigned long)gs_usb_queue_depth(in_q_head, in_q_tail),
                    ep_in_busy ? 1U : 0U,
-                   (unsigned long)ep_in_submit_fail_count);
+                   (unsigned long)ep_in_submit_fail_count,
+                   (unsigned long)echo_backpressure,
+                   (unsigned long)in_rx_dropped);
         }
         gs_usb_main_stage = 1U; /* USB service */
         ewdg_refresh(HPM_EWDG0);
@@ -1978,7 +2187,7 @@ void gs_usb_run(void)
                 mcan_get_protocol_status(mcan_channels[i].base, &psr);
                 
                 uint8_t current_err_state = 0;
-                if (psr.in_bus_off_state) {
+                if (psr.in_bus_off_state || can_tx_states[i].halted) {
                     current_err_state = 3;
                 } else if (psr.in_error_passive_state) {
                     current_err_state = 2;
@@ -2004,7 +2213,6 @@ void gs_usb_run(void)
                                    (unsigned long)mcan_channels[i].base->TDCR);
                         }
                     }
-                    mcan_channels[i].error_state = current_err_state;
                     struct gs_host_frame err_hf = {0};
                     err_hf.channel = (uint8_t)i;
                     err_hf.echo_id = 0xFFFFFFFFU;
@@ -2022,7 +2230,9 @@ void gs_usb_run(void)
                                    (unsigned)ecr.receive_error_count,
                                    (unsigned long)mcan_channels[i].base->PSR);
                         }
-                        (void)enqueue_in_msg(&err_hf, 20U);
+                        if (enqueue_in_msg(&err_hf, 20U)) {
+                            mcan_channels[i].error_state = current_err_state;
+                        }
                         /* 记录 bus-off 时间戳，稍后自动恢复 */
                         if (mcan_channels[i].busoff_detect_us == 0) {
                             mcan_channels[i].busoff_detect_us = gs_usb_get_time_us();
@@ -2043,7 +2253,9 @@ void gs_usb_run(void)
                         mcan_channels[i].busoff_detect_us = 0; // 清除 bus-off 时间戳
                     }
 
-                    (void)enqueue_in_msg(&err_hf, 20U);
+                    if (enqueue_in_msg(&err_hf, 20U)) {
+                        mcan_channels[i].error_state = current_err_state;
+                    }
                 }
 
                 /* Allow transient error-passive states, but recover a channel
@@ -2107,29 +2319,14 @@ void gs_usb_run(void)
         }
         
         gs_usb_main_stage = 6U; /* USB IN */
-        // Flush IN buffer one frame at a time
-        if (in_q_head != in_q_tail && !ep_in_busy) {
-            uint32_t len = in_queue[in_q_tail].len;
-            int ep_status;
-            memcpy(ep_in_dma_buffer, in_queue[in_q_tail].data, len);
-
-            ep_in_busy = true;
-            ep_in_start_us = gs_usb_get_time_us();
-            ep_in_timeout_reported = false;
-            ep_status = usbd_ep_start_write(0, GS_USB_EP_IN, ep_in_dma_buffer, len);
-            if (ep_status != 0) {
-                ep_in_busy = false;
-                ep_in_start_us = 0U;
-                ep_in_submit_fail_count++;
-            }
-        }
+        gs_usb_service_in();
 
         gs_usb_main_stage = 7U; /* heartbeat */
         loop_now_us = gs_usb_get_time_us();
         if (heartbeat_last_us == 0U ||
             (loop_now_us - heartbeat_last_us) >= 1000000U) {
             heartbeat_last_us = loop_now_us;
-            printf("[GS_USB] heartbeat loops=%lu stage=%u poll=%lu OUT=%lu paused=%u armed=%u ring=%u,%u,%u,%u busy=%u,%u,%u,%u RXQ=%lu IN=%u fail=%lu\r\n",
+            printf("[GS_USB] heartbeat loops=%lu stage=%u poll=%lu OUT=%lu paused=%u armed=%u ring=%u,%u,%u,%u busy=%u,%u,%u,%u EQ=%lu RXQ=%lu IN=%u fail=%lu echo_bp=%lu rx_drop=%lu\r\n",
                    (unsigned long)gs_usb_main_loop_count,
                    (unsigned)gs_usb_main_stage,
                    (unsigned long)gs_usb_poll_irq_count,
@@ -2144,9 +2341,12 @@ void gs_usb_run(void)
                    can_tx_states[1].busy ? 1U : 0U,
                    can_tx_states[2].busy ? 1U : 0U,
                    can_tx_states[3].busy ? 1U : 0U,
-                   (unsigned long)((in_q_head + IN_QUEUE_SIZE - in_q_tail) % IN_QUEUE_SIZE),
+                   (unsigned long)gs_usb_queue_depth(echo_q_head, echo_q_tail),
+                   (unsigned long)gs_usb_queue_depth(in_q_head, in_q_tail),
                    ep_in_busy ? 1U : 0U,
-                   (unsigned long)ep_in_submit_fail_count);
+                   (unsigned long)ep_in_submit_fail_count,
+                   (unsigned long)echo_backpressure,
+                   (unsigned long)in_rx_dropped);
         }
     }
 }
