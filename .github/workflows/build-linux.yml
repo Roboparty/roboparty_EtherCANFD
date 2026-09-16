@@ -25,6 +25,8 @@ jobs:
             cd ~/sdk_env
             git submodule update --init --depth 1 hpm_sdk
           fi
+          git -C ~/sdk_env/hpm_sdk fetch origin main --depth 1
+          git -C ~/sdk_env/hpm_sdk checkout --force -B main origin/main
 
       - name: Download toolchain
         run: |

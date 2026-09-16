@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EtherCANFD gs_usb.c 函数入口与跳转逻辑</title>
+<style>
+:root{color-scheme:light;--bg:#f4f6f8;--ink:#17212b;--muted:#5f6b76;--line:#cbd3da;--blue:#dceeff;--green:#e1f5e8;--amber:#fff0c7;--rose:#ffe1e1;--panel:#fff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 "Segoe UI","Microsoft YaHei",sans-serif}
+main{max-width:1240px;margin:0 auto;padding:28px 22px 56px}h1{margin:0 0 6px;font-size:30px}h2{margin:30px 0 12px;font-size:21px;border-bottom:1px solid var(--line);padding-bottom:6px}h3{margin:0 0 7px;font-size:16px}p{margin:7px 0}.meta{color:var(--muted);margin-bottom:22px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(265px,1fr));gap:12px}.box{border:1px solid var(--line);border-radius:7px;padding:13px;background:#fff}.box.blue{background:var(--blue)}.box.green{background:var(--green)}.box.amber{background:var(--amber)}.box.rose{background:var(--rose)}code{font-family:Consolas,monospace;font-size:.92em;background:#eef1f4;border-radius:3px;padding:1px 4px}pre{overflow:auto;background:#18232d;color:#e7edf2;border-radius:7px;padding:15px;line-height:1.55}table{width:100%;border-collapse:collapse;background:#fff}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:9px 10px}th{background:#edf1f4;font-weight:600}.small{color:var(--muted);font-size:13px}.tag{display:inline-block;border:1px solid #aeb8c1;border-radius:12px;padding:1px 8px;margin:2px 4px 2px 0;font-size:12px;background:#fff}.flow{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.node{border:1px solid #82909d;border-radius:6px;padding:8px 12px;background:#fff}.arrow{color:#687683;font-weight:bold;font-size:18px}.note{border-left:4px solid #6d91ad;padding-left:12px;color:#3f4b55}
+</style>
+</head>
+<body><main>
+<h1><code>gs_usb.c</code> 函数入口与跳转逻辑</h1>
+<div class="meta">工程：EtherCANFD　|　分析对象：<code>src/gs_usb.c</code>　|　按当前源码结构整理，未修改 C 源码</div>
+
+<div class="panel note"><b>结论先看：</b>真正的运行入口是 <code>main()</code> 中调用的 <code>gs_usb_run()</code>。<code>gs_usb_run()</code> 完成 USB、CAN 引脚和时钟准备，调用 <code>gs_usb_init()</code> 注册 CherryUSB 描述符、端点和总线回调，然后进入永久主循环。主循环和硬件回调共同推进数据流。</div>
+
+<h2>1. 顶层入口</h2>
+<div class="flow"><div class="node blue"><code>main()</code><br><span class="small">src/main.c</span></div><span class="arrow">-&gt;</span><div class="node blue"><code>gs_usb_run()</code><br><span class="small">gs_usb.c:1992</span></div><span class="arrow">-&gt;</span><div class="node green"><code>board_init_usb()</code></div><span class="arrow">+</span><div class="node green"><code>init_mcan0..3_pins()</code></div><span class="arrow">+</span><div class="node green"><code>gs_usb_init()</code></div></div>
+<div class="panel"><p><code>ENABLE_ETHERCAT=0</code> 时，<code>main()</code> 直接进入 GS_USB；启用 EtherCAT 时，<code>main()</code> 根据 WKUP 引脚在 <code>gs_usb_run()</code> 与 <code>ecat_run()</code> 之间二选一。进入 <code>gs_usb_run()</code> 后不会返回。</p><p><code>gs_usb_init()</code> 的注册顺序：描述符 <code>usbd_desc_register</code> -&gt; 接口及 Vendor handler -&gt; EP OUT/IN 回调 -&gt; <code>usbd_initialize</code> -&gt; 硬件状态输出。</p></div>
+
+<h2>2. 四类运行入口</h2>
+<div class="grid">
+<div class="box blue"><h3>主循环入口</h3><code>gs_usb_run()</code><p class="small">轮询 USB、中断状态、TX 完成、超时恢复、CAN RX、USB IN 和 heartbeat。</p></div>
+<div class="box green"><h3>USB 设备回调</h3><code>gs_usb_bus_event_handler()</code><br><code>gs_usb_ep_out_handler()</code><br><code>gs_usb_ep_in_handler()</code><p class="small">由 CherryUSB/HPM USB ISR 间接调用。</p></div>
+<div class="box amber"><h3>USB 控制请求</h3><code>gs_usb_vendor_request_handler()</code><p class="small">处理 host format、bit timing、mode、open/close 等 Vendor/Class 请求。</p></div>
+<div class="box rose"><h3>MCAN 中断入口</h3><code>gs_usb_can0_isr()</code> ... <code>gs_usb_can3_isr()</code><p class="small">进入统一的 <code>gs_usb_handle_can_tx_irq(ch)</code>。</p></div>
+</div>
+
+<h2>3. 主循环阶段与跳转</h2>
+<pre>while (1)
+  记录 heartbeat pre-usb
+  stage 1: USBD_IRQHandler(0)      // USB UI 中断轮询
+  stage 2: gs_usb_service_tx_complete_poll()
+  stage 3: gs_usb_service_tx_timeouts()
+  stage 4: gs_usb_kick_can_tx(ch)  // 启动各通道待发 TX
+  stage 5: 读取 MCAN RX FIFO0
+          -> 组装 gs_host_frame
+          -> enqueue_in_msg(..., echo_id=0xFFFFFFFF)
+  stage 6: gs_usb_service_in()     // 只提交一个 EP1 IN 传输
+  stage 7: 输出 heartbeat/RX diag
+  回到 while (1)</pre>
+<p class="small">超时分支位于 stage 3 前后：当 <code>ep_in_busy</code> 超过 500 ms 未完成，调用 <code>gs_usb_recover_ep_in()</code> 做 EP1 IN 定向 flush；恢复次数受冷却时间和连续次数限制。</p>
+
+<h2>4. USB 数据路径</h2>
+<div class="grid">
+<div class="box"><h3>主机 -&gt; 设备（Bulk OUT）</h3><p><code>usbd_ep_start_read</code> 完成后进入 <code>gs_usb_ep_out_handler</code>。</p><p><code>gs_usb_ep_out_handler</code> 按通道步长解析 <code>gs_host_frame</code>，进入 <code>tx_ring_push</code>，再调用 <code>gs_usb_kick_can_tx</code>。</p><p>发送完成由 MCAN ISR 或轮询发现，进入 <code>gs_usb_finish_tx</code>，成功时入 echo 队列。</p></div>
+<div class="box"><h3>设备 -&gt; 主机（Bulk IN）</h3><p>CAN RX、TX echo、CAN error 都调用 <code>enqueue_in_msg</code>。</p><p><code>gs_usb_service_in</code> 选择 echo 优先，然后复制到 <code>ep_in_dma_buffer</code> 并调用 <code>usbd_ep_start_write</code>。</p><p>真实完成回调 <code>gs_usb_ep_in_handler</code> 才移动对应队列尾指针并清除 <code>ep_in_busy</code>。</p></div>
+</div>
+
+<h2>5. 回调与中断跳转表</h2>
+<table><thead><tr><th>入口</th><th>触发来源</th><th>主要跳转</th><th>状态影响</th></tr></thead><tbody>
+<tr><td><code>gs_usb_bus_event_handler</code><br><span class="small">:1158</span></td><td>连接、配置、复位、挂起/恢复</td><td>CONFIGURED -&gt; <code>usbd_ep_start_read</code><br>DISCONNECTED/RESET -&gt; 清队列、清通道状态</td><td><code>gs_usb_configured</code>、端点状态、CAN 通道</td></tr>
+<tr><td><code>gs_usb_ep_out_handler</code><br><span class="small">:1018</span></td><td>EP OUT 完成</td><td>解析帧 -&gt; <code>tx_ring_push</code> -&gt; <code>gs_usb_kick_can_tx</code></td><td>TX ring、OUT 背压、CAN TX</td></tr>
+<tr><td><code>gs_usb_ep_in_handler</code><br><span class="small">:1099</span></td><td>EP IN 完成</td><td>移动 echo/RX 队列尾 -&gt; 清 <code>ep_in_busy</code></td><td>USB IN 吞吐和队列排空</td></tr>
+<tr><td><code>gs_usb_vendor_request_handler</code><br><span class="small">:1573</span></td><td>USB 控制端点请求</td><td>按 bRequest 分支：格式、时序、模式、设备配置、打开/关闭通道</td><td>MCAN 配置、模式、返回控制数据</td></tr>
+<tr><td><code>gs_usb_can0_isr</code> ... <code>can3_isr</code></td><td>MCAN IRQ</td><td><code>gs_usb_handle_can_tx_irq(ch)</code> -&gt; <code>gs_usb_finish_tx</code></td><td>TX 完成/取消、echo 入队</td></tr>
+</tbody></table>
+
+<h2>6. 队列与背压关系</h2>
+<pre>CAN RX FIFO0 --read--> in_queue --gs_usb_service_in--> EP1 IN DMA --complete--> host
+                              ^                              |
+                              |                              v
+                         in_rx_dropped                 ep_in_busy=false
+
+Host OUT --> tx_ring[ch] --> MCAN TX --> gs_usb_finish_tx --> echo_queue --+ 
+                                                                            +--> EP1 IN
+echo_queue 高水位 / tx_ring 高水位 --> gs_usb_pause_out()
+队列降到低水位                 --> gs_usb_resume_out_if_possible()</pre>
+<p>当前 <code>in_queue</code> 与 <code>echo_queue</code> 都由 <code>IN_QUEUE_SIZE</code> 控制。RX 入队失败计入 <code>in_rx_dropped</code>，echo 入队失败计入 <code>echo_backpressure</code>。EP1 IN 同一时间只允许一个 DMA 传输，完成回调是队列尾部真正释放点。</p>
+
+<h2>7. 逐函数说明</h2>
+<p>下面按源码出现顺序列出当前 <code>gs_usb.c</code> 的函数定义。声明行中的重复 prototype 不另列；行号用于回到源码定位。</p>
+<table><thead><tr><th>函数（源码行）</th><th>作用</th></tr></thead><tbody>
+<tr><td><code>gs_usb_device_descriptor_callback</code> (:240)</td><td>忽略 speed 参数，返回固定的设备描述符，包含 VID/PID、版本号及字符串索引。</td></tr>
+<tr><td><code>gs_usb_config_descriptor_callback</code> (:246)</td><td>返回当前速度对应的配置描述符。</td></tr>
+<tr><td><code>gs_usb_device_quality_descriptor_callback</code> (:257)</td><td>返回 USB 2.0 Device Qualifier 描述符。</td></tr>
+<tr><td><code>gs_usb_other_speed_descriptor_callback</code> (:263)</td><td>返回另一速度模式使用的配置描述符。</td></tr>
+<tr><td><code>gs_usb_string_descriptor_callback</code> (:274)</td><td>按字符串索引返回厂商、产品和序列号字符串。</td></tr>
+<tr><td><code>gs_usb_irq_save</code> (:447)</td><td>关闭全局中断并返回原 MSTATUS，用于保护共享队列状态。</td></tr>
+<tr><td><code>gs_usb_irq_restore</code> (:452)</td><td>按保存的状态恢复全局中断。</td></tr>
+<tr><td><code>enqueue_in_msg</code> (:459)</td><td>把 RX、echo 或错误帧复制到对应的 USB IN 软件队列；队列满时累计丢帧/背压。</td></tr>
+<tr><td><code>gs_usb_queue_depth</code> (:510)</td><td>用环形索引计算队列当前深度。</td></tr>
+<tr><td><code>gs_usb_print_rx_diagnostics</code> (:515)</td><td>输出 RX 队列峰值、分通道丢帧、MCAN FIFO 丢失事件及 USB IN 速率。</td></tr>
+<tr><td><code>gs_usb_service_in</code> (:559)</td><td>在 EP1 IN 空闲时选择 echo/RX 队首，复制到 DMA 缓冲并提交 USB 写传输。</td></tr>
+<tr><td><code>gs_usb_get_time_us</code> (:588)</td><td>把 RISC-V cycle 计数换算为微秒时间戳。</td></tr>
+<tr><td><code>gs_usb_recover_ep_in</code> (:600)</td><td>EP1 IN 超时后执行有界 flush，并重置端点软件状态以便重试。</td></tr>
+<tr><td><code>tx_ring_push</code> (:683)</td><td>向指定 CAN 通道的 TX 环形队列追加主机帧。</td></tr>
+<tr><td><code>tx_ring_pop</code> (:702)</td><td>取出并删除 TX 环形队列队首。</td></tr>
+<tr><td><code>tx_ring_peek</code> (:721)</td><td>查看 TX 队首而不删除，用于超时和调度判断。</td></tr>
+<tr><td><code>tx_ring_drop_head</code> (:736)</td><td>丢弃 TX 环形队列队首。</td></tr>
+<tr><td><code>tx_ring_count</code> (:748)</td><td>读取指定通道 TX 队列长度。</td></tr>
+<tr><td><code>gs_usb_should_pause_out</code> (:756)</td><td>检查 echo 队列或任一 TX ring 是否达到高水位。</td></tr>
+<tr><td><code>gs_usb_can_resume_out</code> (:772)</td><td>检查所有背压队列是否降到低水位。</td></tr>
+<tr><td><code>gs_usb_pause_out</code> (:788)</td><td>暂停下一次 Bulk OUT 读取，阻止主机继续灌入 TX。</td></tr>
+<tr><td><code>gs_usb_resume_out_if_possible</code> (:794)</td><td>满足低水位条件时重新提交 Bulk OUT 读取。</td></tr>
+<tr><td><code>gs_usb_get_channel_error_state</code> (:805)</td><td>读取并转换 MCAN 当前 error-active、warning、passive 或 bus-off 状态。</td></tr>
+<tr><td><code>gs_usb_flush_tx_ring</code> (:824)</td><td>逐项取出指定通道的 TX ring 内容并尝试放入 echo 队列；不是把这些帧重新发到 CAN，总 echo 队列满时入队可能失败。</td></tr>
+<tr><td><code>gs_usb_finish_tx</code> (:833)</td><td>确认 CAN TX 完成/取消，释放 busy 状态并生成 echo（必要时 loopback echo）。</td></tr>
+<tr><td><code>gs_usb_kick_can_tx</code> (:894)</td><td>通道已打开、未 halted 且不 busy 时查看 TX 队首，转换为 MCAN 帧并非阻塞提交。提交成功才移除队首并保存 inflight 状态；提交失败保留队首；主机送来的 CAN 错误帧作为无效 TX 丢弃。</td></tr>
+<tr><td><code>is_in_noncache_region</code> (:974)</td><td>判断地址区间是否位于 USB DMA 使用的 non-cache 区域。</td></tr>
+<tr><td><code>gs_usb_dump_mem_layout</code> (:984)</td><td>打印 USB 描述符、端点缓冲和 non-cache 内存布局。</td></tr>
+<tr><td><code>gs_usb_dump_hw_regs</code> (:1001)</td><td>按标签打印 USB 控制器关键寄存器。</td></tr>
+<tr><td><code>gs_usb_ep_out_handler</code> (:1018)</td><td>处理 Bulk OUT 完成，解析主机帧、入 TX ring、启动 CAN TX，并按背压决定是否续读。</td></tr>
+<tr><td><code>gs_usb_ep_in_handler</code> (:1099)</td><td>处理 Bulk IN 完成，统计完成速率，移动对应队列尾并清除 <code>ep_in_busy</code>。</td></tr>
+<tr><td><code>gs_usb_stop_and_clear_channel</code> (:1131)</td><td>停止并清理一个 CAN 通道的硬件、TX 状态和错误状态。</td></tr>
+<tr><td><code>gs_usb_bus_event_handler</code> (:1158)</td><td>处理 USB connect、disconnect、reset、configured、suspend、resume 事件。</td></tr>
+<tr><td><code>gs_usb_notify_handler</code> (:1228)</td><td>保留的 USB 通知入口；当前不执行实际逻辑。</td></tr>
+<tr><td><code>gs_usb_handle_can_tx_irq</code> (:1235)</td><td>读取 MCAN IRQ 标志，处理 TX completed/cancelled，并记录 FIFO0 丢失事件。</td></tr>
+<tr><td><code>gs_usb_service_tx_timeouts</code> (:1283)</td><td>扫描 inflight TX：满 20 ms 后若硬件已结束则补做完成处理，否则申请取消；满 40 ms 仍 pending 时设置 halted 并进入 MCAN INIT，等待主机重启通道。</td></tr>
+<tr><td><code>gs_usb_recover_channel</code> (:1370)</td><td>按保存的时序和模式重新初始化单个 MCAN 通道。</td></tr>
+<tr><td><code>gs_usb_service_tx_complete_poll</code> (:1501)</td><td>轮询 TX buffer/event FIFO，补足可能遗漏的 MCAN TX 中断完成。</td></tr>
+<tr><td><code>gs_usb_can0_isr</code> (:1545)</td><td>CAN0 中断入口：递增通道 0 的 IRQ 计数，调用 <code>gs_usb_handle_can_tx_irq(0)</code>。</td></tr>
+<tr><td><code>gs_usb_can1_isr</code> (:1552)</td><td>CAN1 中断入口：递增通道 1 的 IRQ 计数，调用 <code>gs_usb_handle_can_tx_irq(1)</code>。</td></tr>
+<tr><td><code>gs_usb_can2_isr</code> (:1559)</td><td>CAN2 中断入口：递增通道 2 的 IRQ 计数，调用 <code>gs_usb_handle_can_tx_irq(2)</code>。</td></tr>
+<tr><td><code>gs_usb_can3_isr</code> (:1566)</td><td>CAN3 中断入口：递增通道 3 的 IRQ 计数，调用 <code>gs_usb_handle_can_tx_irq(3)</code>。</td></tr>
+<tr><td><code>gs_usb_vendor_request_handler</code> (:1573)</td><td>处理 gs_usb Vendor/Class 控制请求，配置主机格式、bit timing、CAN 模式、通道 open/close 和设备信息。</td></tr>
+<tr><td><code>gs_usb_init</code> (:1957)</td><td>注册 USB 描述符、接口、Vendor handler、Bulk OUT/IN 端点和总线事件回调。</td></tr>
+<tr><td><code>gs_usb_watchdog_init</code> (:1977)</td><td>配置 1 秒超时复位的 EWDG 看门狗。</td></tr>
+<tr><td><code>gs_usb_run</code> (:1992)</td><td>初始化 USB/CAN 运行环境并执行永久主循环，是 GS_USB 模式的核心调度入口。</td></tr>
+</tbody></table>
+
+<h2>8. 函数索引</h2>
+<p class="note">定义不等于正在使用：<code>gs_usb_get_channel_error_state</code>、<code>gs_usb_recover_channel</code>、<code>is_in_noncache_region</code> 当前没有调用点；<code>gs_usb_notify_handler</code> 是空函数且未注册。内存布局和寄存器 dump 的详细输出受 <code>GS_USB_LOG_ENABLE=0</code> 限制。不要把这些保留函数当成运行中的自动恢复路径。</p>
+<table><thead><tr><th>类别</th><th>函数</th><th>职责</th></tr></thead><tbody>
+<tr><td>初始化/入口</td><td><code>gs_usb_run</code>, <code>gs_usb_init</code>, <code>gs_usb_watchdog_init</code></td><td>外设准备、USB 注册、看门狗和主循环</td></tr>
+<tr><td>USB 描述符</td><td><code>gs_usb_*_descriptor_callback</code></td><td>按 USB speed/index 返回描述符</td></tr>
+<tr><td>队列/IN</td><td><code>enqueue_in_msg</code>, <code>gs_usb_service_in</code>, <code>gs_usb_ep_in_handler</code>, <code>gs_usb_print_rx_diagnostics</code></td><td>入队、提交、完成、统计</td></tr>
+<tr><td>OUT/TX</td><td><code>gs_usb_ep_out_handler</code>, <code>tx_ring_push/pop/peek/drop_head</code>, <code>gs_usb_kick_can_tx</code>, <code>gs_usb_finish_tx</code></td><td>解析主机帧、发送 CAN、生成 echo</td></tr>
+<tr><td>恢复/背压</td><td><code>gs_usb_should_pause_out</code>, <code>gs_usb_pause_out</code>, <code>gs_usb_resume_out_if_possible</code>, <code>gs_usb_recover_ep_in</code>, <code>gs_usb_recover_channel</code></td><td>限流、端点恢复、通道恢复</td></tr>
+<tr><td>MCAN</td><td><code>gs_usb_can0_isr</code> ... <code>gs_usb_can3_isr</code>, <code>gs_usb_handle_can_tx_irq</code>, <code>gs_usb_service_tx_complete_poll</code>, <code>gs_usb_service_tx_timeouts</code></td><td>中断和轮询双路径处理 TX 状态</td></tr>
+<tr><td>控制请求</td><td><code>gs_usb_vendor_request_handler</code></td><td>Linux gs_usb 协议控制面</td></tr>
+</tbody></table>
+
+<h2>9. 排查时的关键观察点</h2>
+<div class="grid"><div class="box"><h3>USB IN 卡住</h3><p>看 <code>ep_in_busy</code>、<code>IN</code>、<code>fail</code>、EP1 状态寄存器，以及 <code>gs_usb_recover_ep_in</code> 日志。</p></div><div class="box"><h3>CAN RX 丢帧</h3><p>看 <code>RXQ</code>、<code>RX diag peak</code>、<code>drop_ch</code> 和 <code>RF0L_evt</code>，区分软件队列满与 MCAN FIFO 溢出。</p></div><div class="box"><h3>CAN TX 无 ACK</h3><p>看 <code>TX_WARNING</code>/<code>TX_PASSIVE</code>、TEC/REC、CAN 收发器供电和总线物理连接。</p></div></div>
+<p class="small">行号以生成本 HTML 时的源码为准；如果源码继续变更，应重新生成此文档。</p>
+</main></body></html>

@@ -49,7 +49,7 @@ find_package(hpm-sdk REQUIRED HINTS $ENV)
 project(ethercanfd)
 
 # ---- Release version ----
-set(FIRMWARE_VERSION "1.0.6" CACHE STRING "Firmware semantic version")
+set(FIRMWARE_VERSION "1.1.0" CACHE STRING "Firmware semantic version")
 
 string(TIMESTAMP BUILD_DATE "%Y%m%d")
 

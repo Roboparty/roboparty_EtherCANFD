@@ -416,6 +416,13 @@ static struct in_msg echo_queue[IN_QUEUE_SIZE];
 static volatile uint32_t echo_q_head = 0;
 static volatile uint32_t echo_q_tail = 0;
 static volatile uint32_t in_rx_dropped = 0;
+static volatile uint32_t in_rx_dropped_ch[GS_USB_CAN_CHANNEL_COUNT];
+static volatile uint32_t in_rx_queue_peak = 0;
+static volatile uint32_t in_rx_queue_peak_interval = 0;
+static volatile uint32_t mcan_rxfifo0_lost_events[GS_USB_CAN_CHANNEL_COUNT];
+static volatile uint32_t ep_in_completed = 0;
+static volatile uint32_t ep_in_rx_completed = 0;
+static volatile uint32_t ep_in_completed_bytes = 0;
 static volatile uint32_t echo_backpressure = 0;
 enum gs_usb_in_queue_kind {
     GS_USB_IN_QUEUE_NONE = 0,
@@ -434,6 +441,8 @@ static void gs_usb_service_tx_complete_poll(void);
 static void gs_usb_recover_channel(uint8_t ch);
 static void gs_usb_service_in(void);
 static uint64_t gs_usb_get_time_us(void);
+static void gs_usb_print_rx_diagnostics(uint64_t now_us);
+static uint32_t gs_usb_queue_depth(volatile uint32_t head, volatile uint32_t tail);
 
 static uint32_t gs_usb_irq_save(void)
 {
@@ -473,6 +482,10 @@ static bool enqueue_in_msg(const void *data, uint32_t len)
             echo_backpressure++;
         } else {
             in_rx_dropped++;
+            uint8_t ch = ((const struct gs_host_frame *)data)->channel;
+            if (ch < GS_USB_CAN_CHANNEL_COUNT) {
+                in_rx_dropped_ch[ch]++;
+            }
         }
         gs_usb_irq_restore(level);
         return false;
@@ -481,6 +494,15 @@ static bool enqueue_in_msg(const void *data, uint32_t len)
     memcpy(queue[*head].data, data, len);
     queue[*head].len = len;
     *head = next;
+    if (!is_echo) {
+        uint32_t depth = gs_usb_queue_depth(*head, *tail);
+        if (depth > in_rx_queue_peak) {
+            in_rx_queue_peak = depth;
+        }
+        if (depth > in_rx_queue_peak_interval) {
+            in_rx_queue_peak_interval = depth;
+        }
+    }
     gs_usb_irq_restore(level);
     return true;
 }
@@ -488,6 +510,50 @@ static bool enqueue_in_msg(const void *data, uint32_t len)
 static uint32_t gs_usb_queue_depth(volatile uint32_t head, volatile uint32_t tail)
 {
     return (head + IN_QUEUE_SIZE - tail) % IN_QUEUE_SIZE;
+}
+
+static void gs_usb_print_rx_diagnostics(uint64_t now_us)
+{
+    static uint64_t last_us;
+    static uint32_t last_completed;
+    static uint32_t last_rx_completed;
+    static uint32_t last_completed_bytes;
+    uint32_t level = gs_usb_irq_save();
+    uint32_t completed = ep_in_completed;
+    uint32_t rx_completed = ep_in_rx_completed;
+    uint32_t completed_bytes = ep_in_completed_bytes;
+    uint32_t peak = in_rx_queue_peak;
+    uint32_t interval_peak = in_rx_queue_peak_interval;
+    uint32_t dropped[GS_USB_CAN_CHANNEL_COUNT];
+    uint32_t fifo_lost[GS_USB_CAN_CHANNEL_COUNT];
+    uint32_t elapsed_us = last_us == 0U ? 0U : (uint32_t)(now_us - last_us);
+
+    for (uint8_t ch = 0U; ch < GS_USB_CAN_CHANNEL_COUNT; ch++) {
+        /* TX IRQ also records RF0L before its existing clear-all operation. */
+        if (mcan_channels[ch].is_open &&
+            (mcan_get_interrupt_flags(mcan_channels[ch].base) & MCAN_INT_RXFIFO0_MSG_LOST) != 0U) {
+            mcan_rxfifo0_lost_events[ch]++;
+            mcan_clear_interrupt_flags(mcan_channels[ch].base, MCAN_INT_RXFIFO0_MSG_LOST);
+        }
+        dropped[ch] = in_rx_dropped_ch[ch];
+        fifo_lost[ch] = mcan_rxfifo0_lost_events[ch];
+    }
+    in_rx_queue_peak_interval = gs_usb_queue_depth(in_q_head, in_q_tail);
+    gs_usb_irq_restore(level);
+
+    printf("[GS_USB] RX diag peak=%lu/%lu drop_ch=%lu,%lu,%lu,%lu RF0L_evt=%lu,%lu,%lu,%lu IN/s=%lu RX/s=%lu B/s=%lu\r\n",
+           (unsigned long)interval_peak, (unsigned long)peak,
+           (unsigned long)dropped[0], (unsigned long)dropped[1],
+           (unsigned long)dropped[2], (unsigned long)dropped[3],
+           (unsigned long)fifo_lost[0], (unsigned long)fifo_lost[1],
+           (unsigned long)fifo_lost[2], (unsigned long)fifo_lost[3],
+           (unsigned long)(elapsed_us ? ((uint64_t)(completed - last_completed) * 1000000U / elapsed_us) : 0U),
+           (unsigned long)(elapsed_us ? ((uint64_t)(rx_completed - last_rx_completed) * 1000000U / elapsed_us) : 0U),
+           (unsigned long)(elapsed_us ? ((uint64_t)(completed_bytes - last_completed_bytes) * 1000000U / elapsed_us) : 0U));
+    last_us = now_us;
+    last_completed = completed;
+    last_rx_completed = rx_completed;
+    last_completed_bytes = completed_bytes;
 }
 
 static void gs_usb_service_in(void)
@@ -1036,11 +1102,16 @@ void gs_usb_ep_in_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 
     (void)busid;
     (void)ep;
-    (void)nbytes;
-
     /* The queue entry remains owned by USB DMA until this real completion
      * callback.  Never release it merely because a software timer expired. */
     level = gs_usb_irq_save();
+    if (ep_in_busy) {
+        ep_in_completed++;
+        ep_in_completed_bytes += nbytes;
+        if (ep_in_queue_kind == GS_USB_IN_QUEUE_RX) {
+            ep_in_rx_completed++;
+        }
+    }
     if (ep_in_busy && ep_in_queue_kind == GS_USB_IN_QUEUE_ECHO &&
         echo_q_head != echo_q_tail) {
         echo_q_tail = (echo_q_tail + 1U) % IN_QUEUE_SIZE;
@@ -1174,6 +1245,9 @@ static void gs_usb_handle_can_tx_irq(uint8_t ch)
     }
 
     flags = mcan_get_interrupt_flags(mcan_channels[ch].base);
+    if ((flags & MCAN_INT_RXFIFO0_MSG_LOST) != 0U) {
+        mcan_rxfifo0_lost_events[ch]++;
+    }
     if ((flags & (MCAN_INT_TX_COMPLETED | MCAN_INT_TX_CANCEL_FINISHED)) == 0U) {
         mcan_clear_interrupt_flags(mcan_channels[ch].base, flags);
         return;
@@ -2049,6 +2123,7 @@ void gs_usb_run(void)
                    (unsigned long)ep_in_submit_fail_count,
                    (unsigned long)echo_backpressure,
                    (unsigned long)in_rx_dropped);
+            gs_usb_print_rx_diagnostics(loop_now_us);
         }
         gs_usb_main_stage = 1U; /* USB service */
         ewdg_refresh(HPM_EWDG0);
@@ -2347,6 +2422,7 @@ void gs_usb_run(void)
                    (unsigned long)ep_in_submit_fail_count,
                    (unsigned long)echo_backpressure,
                    (unsigned long)in_rx_dropped);
+            gs_usb_print_rx_diagnostics(loop_now_us);
         }
     }
 }

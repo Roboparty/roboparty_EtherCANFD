@@ -24,6 +24,8 @@ jobs:
           } else {
             git clone https://github.com/hpmicro/sdk_env.git --depth 1 --recurse-submodules C:\sdk_env
           }
+          git -C C:\sdk_env\hpm_sdk fetch origin main --depth 1
+          git -C C:\sdk_env\hpm_sdk checkout --force -B main origin/main
 
       - name: Set environment
         run: |
