@@ -12,9 +12,11 @@ endif()
 # J-Link Flash Programming Support
 # ============================================================================
 
+option(ENABLE_JLINK "Detect J-Link and generate flash targets" ON)
+
 set(JLINK_EXE "JLINK_EXE-NOTFOUND" CACHE FILEPATH "Path to JLinkExe executable")
 
-if(NOT JLINK_EXE OR JLINK_EXE STREQUAL "JLINK_EXE-NOTFOUND")
+if(ENABLE_JLINK AND (NOT JLINK_EXE OR JLINK_EXE STREQUAL "JLINK_EXE-NOTFOUND"))
     if(DEFINED ENV{JLINK_PATH})
         find_program(JLINK_EXE
             NAMES JLink JLink.exe JLinkExe JLinkExe.exe JLink_CommandLine JLink_CommandLine.sh
@@ -30,9 +32,12 @@ endif()
 if(JLINK_EXE)
     message(STATUS "J-Link found: ${JLINK_EXE}")
     set(JLINK_FOUND TRUE)
-else()
+elseif(ENABLE_JLINK)
     message(STATUS "J-Link not found. Flash targets will not be available.")
-    message(STATUS "   Please set JLINK_PATH environment variable or install J-Link from https://www.segger.com/downloads/jlink/")
+    message(STATUS "   Set ENABLE_JLINK=OFF to skip this check, or set JLINK_PATH to use J-Link.")
+    set(JLINK_FOUND FALSE)
+else()
+    message(STATUS "J-Link disabled (ENABLE_JLINK=OFF). Flash targets will not be available.")
     set(JLINK_FOUND FALSE)
 endif()
 
@@ -74,8 +79,6 @@ if(JLINK_FOUND)
         COMMENT "Verifying flash via J-Link..."
         USES_TERMINAL
     )
-else()
-    message(WARNING "J-Link targets not available. Install J-Link and ensure JLinkExe is in PATH.")
 endif()
 
 # ============================================================================
