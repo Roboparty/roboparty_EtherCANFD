@@ -1,84 +1,181 @@
-# EtherCAT 分支说明
+# roboparty EtherCANFD —— gs_usb 固件编译指南
 
-本文档只记录 EtherCAT 分支（PDO/SDO/FoE）开发与联调流程。
-gs_usb 分支已全部完成，不在此文档中展开。
+4 路 CAN FD ↔ USB 转换器固件，USB 侧实现 **gs_usb** 协议。
+插到 Linux 上就是标准 SocketCAN 设备（can0 ~ can3），不需要任何厂商驱动。
 
-## 0. 硬件 LED 指示灯
+---
 
-板载 6 个 LED，分两种引脚布局，由 PF27 (ADC0.IN00) 电压自动识别：
+## 1. 概览
 
-| 电压 | 引脚布局 | CAN0 | CAN1 | CAN2 | CAN3 | USB/ECAT | MODE |
-|------|---------|------|------|------|------|----------|------|
-| >1.2V (默认) | PF02-07 | PF02 绿 | PF03 绿 | PF04 绿 | PF05 绿 | PF06 蓝 | PF07 黄 |
-| <1.2V (alt)  | PB26-31 | PB26 绿 | PB27 绿 | PB28 绿 | PB29 绿 | PB30 蓝 | PB31 黄 |
+基于 HPMicro **HPM5E31**（RISC-V rv32imac）的 USB-CANFD 转换固件。固件把 4 路独立
+CAN FD 控制器经 USB 高速接口暴露给主机，协议为社区通用的 **gs_usb**（candleLight 兼容），
+因此 Linux 内核自带的 `gs_usb` 驱动、`python-can`、cangaroo 等工具可直接使用。
 
-### EtherCAT 模式
+| 项目 | 值 |
+|---|---|
+| SoC | HPM5E31（HPM5E00 系列） |
+| 内核架构 | RISC-V rv32imac_zicsr_zifencei |
+| Flash | XPI0 NOR，固件烧写地址 `0x80000400` |
+| USB | High-Speed，VID `0x1209` / PID `0x2323` |
+| 序列号 | `202604070001` |
+| 端点 | EP1 IN（`0x81`）/ EP2 OUT（`0x02`），512 字节包 |
+| CAN 通道 | 4 路独立 CAN FD |
+| 固件版本 | 1.1.0 |
 
-| LED | 行为 |
-|-----|------|
-| 绿灯 CAN0~3 | 对应通道有 CAN 帧收发时闪（持续约 50~200ms） |
-| 蓝灯 ECAT | INIT → 灭，PREOP → 慢闪，SAFEOP → 快闪，OP → 常亮 |
-| 黄灯 MODE | OP 状态 → 常亮，其他状态 → 灭 |
+---
 
-### GS_USB 模式
+## 2. 环境准备
 
-| LED | 行为 |
-|-----|------|
-| 绿灯 CAN0~3 | 对应通道有 CAN 帧收发时闪（持续约 50~200ms） |
-| 蓝灯 USB | 未连接 → 灭，已连接未配置 → 慢闪，已配置 → 快闪 |
-| 黄灯 MODE | 持续慢闪（约 500k 主循环 tick 翻转） |
+### 2.1 依赖
 
-## 1. 环境准备
+| 依赖 | 版本 | 来源 |
+|---|---|---|
+| CMake | ≥ 3.13 | sdk_env 自带 |
+| Ninja | 任意 | sdk_env 自带 |
+| Python 3 | 3.x | sdk_env 自带 |
+| RISC-V GNU 工具链 | `rv32imac_zicsr_zifencei_multilib_b_ext`（GCC 13.2.0） | sdk_env 自带 |
+| hpm_sdk | 1.13.0（已验证） | 随 sdk_env 一并 clone |
 
-1. 准备 HPM SDK 环境：
-	https://github.com/hpmicro/sdk_env
-2. 在当前工程目录加载环境：
+### 2.2 安装 sdk_env
+
+若本机尚无 `C:\sdk_env`，先安装 HPMicro 官方 SDK 环境（含工具链、CMake、Ninja、Python3）：
+
+```powershell
+git clone --recurse-submodules https://github.com/hpmicro/sdk_env.git C:\sdk_env
+```
+
+装到别的路径也可以，但需要同步修改 `env.ps1` 里的路径。
+
+### 2.3 加载环境
+
+工程根目录下的 `env.ps1` 会一次性设置好全部环境变量与工具路径，**每开一个新终端都要执行一次**：
 
 ```powershell
 . .\env.ps1
 ```
 
-3. 确认关键环境变量：
+> 注意开头的 `. `（点 + 空格）不能省略，它表示在当前会话中执行；
+> 直接 `.\env.ps1` 在子作用域运行，环境变量不会留在当前终端里。
 
-```powershell
-$env:HPM_SDK_BASE
-$env:JLINK_PATH
-```
-
-## 2. EtherCAT 固件构建
-
-```powershell
-
-
-cmake -B build -S . -G Ninja 
+成功时输出：
 
 ```
-
-说明：
-1. 当前文档默认构建 EtherCAT 固件（即 `BUILD_GS_USB=OFF` 默认路径）。
-2. 如需切板卡，请在 `CMakeLists.txt` 中调整 `BOARD`。
-
-## 3. 烧录
-
-```powershell
-cmake --build build --target jlink_flash
+环境已加载:
+  HPM_SDK_BASE = C:\sdk_env\hpm_sdk
+  GNURISCV_TOOLCHAIN_PATH = C:\sdk_env\toolchains\rv32imac_zicsr_zifencei_multilib_b_ext-win
 ```
 
-## 4. EtherCAT 联调与验收
+`env.ps1` 会设置这些内容：
 
-1. 主从站 PDO 576 字节映射联调（4 路 TX + 4 路 RX）。
-2. SDO 配置与状态查询联调（`0x8000` 配置、`0x9000` 状态）。
-3. FoE 升级流程验证（写入、校验、重启回读版本）。
-4. 四路 CANFD 独立通道验证（并发收发、错误注入、恢复）。
+| 变量 | 值 |
+|---|---|
+| `HPM_SDK_BASE` | `C:\sdk_env\hpm_sdk` |
+| `GNURISCV_TOOLCHAIN_PATH` | `C:\sdk_env\toolchains\rv32imac_zicsr_zifencei_multilib_b_ext-win` |
+| `HPM_SDK_TOOLCHAIN_VARIANT` | 空 |
+| `PATH` 追加 | `C:\sdk_env\tools\cmake\bin`、`C:\sdk_env\tools\ninja`、`C:\sdk_env\tools\python3` |
+| `JLINK_PATH` | `C:\Program Files\SEGGER\JLink`（该目录存在时才设置） |
 
-## 5. 压力测试项（EtherCAT）
+---
 
-1. 周期负载压测：持续高频 PDO 收发，统计丢帧与抖动。
-2. 极限吞吐压测：多通道满载报文，检查 CPU 占用与错误计数。
-3. 异常恢复压测：Bus-Off、Error Passive、链路抖动后的恢复能力。
+## 3. 编译
 
-移植指南：在board文件夹移植指定的hpm芯片，注意hpm6e系列需要运用patch文件：https://github.com/hpmicro/sdk_env/blob/main/hpm_sdk/samples/ethercat/ecat_io/README_zh.rst
+### 3.1 三条命令
+
+在**工程根目录**打开 PowerShell：
+
+```powershell
+# 1) 加载环境
+. .\env.ps1
+
+# 2) 配置
+cmake -B build -S . -G Ninja
+
+# 3) 编译
+cmake --build build --parallel
+```
+
+本工程**默认即构建 gs_usb 固件**，不需要任何额外开关；板卡（`ethercanfd`）与构建类型
+（`flash_xip`）也都是默认值，所以配置命令可以写得这么短。想显式写全等价于：
+
+```powershell
+cmake -B build -S . -G Ninja -DBOARD=ethercanfd -DHPM_BUILD_TYPE=flash_xip
+```
+
+配置成功的标志：
+
+```
+-- hpm_sdk: 1.13.0 (C:\sdk_env\hpm_sdk)
+-- GNU ld linker script: .../soc/HPM5E00/HPM5E31/toolchains/gcc/flash_xip.ld
+-- Configuring done
+-- Generating done
+```
+
+编译成功后末尾会打印内存占用：
+
+```
+Memory region         Used Size  Region Size  %age Used
+           FLASH:      116128 B         1 MB     11.07%
+             ILM:        2648 B       128 KB      2.02%
+             DLM:         32 KB       128 KB     25.00%
+        AXI_SRAM:       56112 B       192 KB     28.54%
+AXI_SRAM_NONCACHEABLE:   14344 B        64 KB     21.89%
+        AHB_SRAM:         10 KB        32 KB     31.25%
+```
+
+### 3.2 编译产物
+
+全部在 `build/output/` 下：
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `ethercanfd.bin` | 116256 B | **烧录用**，已含 HPM 引导头 |
+| `ethercanfd_v1.1.0-<日期>.bin` | 116256 B | 带版本号的副本 |
+| `ethercanfd.elf` | — | 调试用可执行文件 |
+| `ethercanfd.map` | — | 内存与符号分布 |
+| `ethercanfd.asm` | — | 反汇编 |
+
+`ethercanfd.bin` 开头 16 字节为：
+
+```
+02 00 F9 FC 05 00 00 00 00 10 00 00 00 00 00 00
+```
+
+小端解读即 `0xfcf90002, 0x05, 0x1000, 0x0`，这正是烧录工具所需的引导头，
+**无需再做任何镜像转换**，可直接烧写。
+
+### 3.3 重新编译
+
+Ninja 会增量编译，改一个源文件只重编受影响的部分。若改动了 CMake 选项或板级配置，
+必须清掉构建目录，否则会残留旧对象：
+
+```powershell
+Remove-Item -Recurse -Force build
+cmake -B build -S . -G Ninja
+cmake --build build --parallel
+```
+
+只想强制重编应用代码（约 5 秒，SDK 库不动）：
+
+```powershell
+cmake --build build --target clean
+cmake --build build --parallel
+```
 
 
-# roboto_usb4can CAN FD 1M/5M (gs_usb)
-SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="2323", ATTRS{serial}=="202604070001", KERNEL=="can*", RUN+="/sbin/ip link set %k type can bitrate 1000000 sample-point 0.800 sjw 4 dbitrate 5000000 dsample-point 0.750 dsjw 2 fd on one-shot on restart-ms 100", RUN+="/sbin/ip link set %k mtu 72", RUN+="/sbin/ip link set %k txqueuelen 100", RUN+="/sbin/ip link set %k up"
+
+
+
+## 4. 目录速览
+
+```
+CMakeLists.txt          顶层构建脚本（板卡、版本号、源文件列表）
+env.ps1                 环境变量：SDK 路径、工具链、cmake/ninja/python3 的 PATH
+app.yaml                SDK 组件依赖声明
+src/
+  main.c                入口：LED 自检 + 启动 gs_usb 主循环
+  gs_usb.c              gs_usb 协议实现（4 路 CAN FD ↔ USB）
+  usb_config.h          USB 描述符配置
+  version.h.in          版本号模板，由 CMake 生成到 build/generated/
+boards/ethercanfd/      板级支持：时钟、引脚复用、CAN 收发器、LED
+doc/dfu.md              HPM Manufacturing Tool 烧录参考
+```
