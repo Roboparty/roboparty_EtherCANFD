@@ -109,6 +109,7 @@ endif()
 
 sdk_inc(src)
 sdk_inc(${CMAKE_CURRENT_BINARY_DIR}/generated)
+sdk_app_src(src/can_irq_dispatch.c)
 sdk_app_src(src/gs_usb.c)
 sdk_app_src(src/main.c)
 

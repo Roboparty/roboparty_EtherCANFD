@@ -504,7 +504,11 @@ void board_init_clock(void)
 
     /* Bump up DCDC voltage to 1275mv */
     pcfg_dcdc_set_voltage(HPM_PCFG, 1275);
-    pcfg_dcdc_switch_to_dcm_mode(HPM_PCFG);
+    /* SDK >= 1.12 handles mode-specific voltage updates in set_voltage().
+     * Match the upstream HPM5E00 EVK: do not force DCM afterward.
+     * Omitting this call does not guarantee CCM; the existing mode is retained.
+     */
+    // pcfg_dcdc_switch_to_dcm_mode(HPM_PCFG);
 
     /* Configure PLL0 Post Divider */
     pllctlv2_set_postdiv(HPM_PLLCTLV2, pllctlv2_pll0, pllctlv2_clk0, pllctlv2_div_1p0);    /* PLL0CLK0: 480MHz */

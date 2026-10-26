@@ -5,7 +5,6 @@
 #include <string.h>
 #include "board.h"
 #include "hpm_mchtmr_drv.h"
-#define ESC_SM_WD_SUPPORTED 0
 #include "ecat_def.h"
 #include "ecatappl.h"
 #include "ecatslv.h"
@@ -17,6 +16,8 @@
 #include "hpm_mcan_drv.h"
 #include "hpm_mcan_regs.h"
 #include "hpm_csr_drv.h"
+#include "can_irq_dispatch.h"
+#include "gs_usb_time.h"
 
 /* Performance and Debug Logging Control */
 #define ECANT_DEBUG_LOG 0
@@ -29,8 +30,8 @@
 #define ECANT_TX_PENDING_TIMEOUT_US (20000ULL)
 #define ECANT_RX_QUEUE_DEPTH (16U)
 #define ECANT_LED_ON_TICKS (50U)
-#define ECANT_CAN2_LOWLEVEL_TIMING_AB_TEST (1)
-#define ECANT_CAN2_TX_FORCE_NO_BRS_AB_TEST (1)
+#define ECANT_CAN2_LOWLEVEL_TIMING_AB_TEST (0)
+#define ECANT_CAN2_TX_FORCE_NO_BRS_AB_TEST (0)
 #define ECANT_CAN2_TX_FORCE_CLASSIC_AB_TEST (0)
 
 typedef struct {
@@ -101,6 +102,9 @@ static bool s_canfd_tx_left_op_reported[4] = {false, false, false, false};
 static bool s_canfd_tx_cancel_requested[4] = {false, false, false, false};
 static uint64_t s_canfd_tx_start_us[4] = {0, 0, 0, 0};
 static uint16_t s_canfd_tx_trigger_seen[4] = {0, 0, 0, 0};
+static uint16_t s_canfd_tx_trigger_observed[4];
+static uint64_t s_canfd_tx_trigger_us[4];
+static uint32_t s_canfd_tx_expired[4];
 static uint8_t s_can_led_ticks[4] = {0, 0, 0, 0};
 static uint16_t s_ecat_usb_led_tick;
 static bool s_can2_tx_ab_override_reported = false;
@@ -108,6 +112,10 @@ static bool s_can2_tx_ab_override_reported = false;
 static MCAN_Type *s_can_bases[4] = {BOARD_CAN0_BASE, BOARD_CAN1_BASE, BOARD_CAN2_BASE, BOARD_CAN3_BASE};
 static uint32_t s_can_irqs[4] = {BOARD_CAN0_IRQn, BOARD_CAN1_IRQn, BOARD_CAN2_IRQn, BOARD_CAN3_IRQn};
 static uint32_t s_can_clk_hz[4];
+static bool s_can_ready[4];
+static volatile hpm_stat_t s_can_init_status[4];
+static bool apply_can_config(uint8_t ch);
+static void sync_shadow_to_config_object(uint8_t ch);
 
 static bool sanitize_channel_config(uint8_t ch, bool *normalized);
 static void sanitize_data_control(void);
@@ -265,19 +273,15 @@ static void reset_all_tx_runtime_state(bool clear_pdo, bool clear_trigger_seen)
 static void cancel_all_hw_tx_buffers(uint8_t ch)
 {
     uint32_t txbc = s_can_bases[ch]->TXBC;
-    uint32_t num_bufs = MCAN_TXBC_NDTB_GET(txbc);
-    for (uint32_t i = 0; i < num_bufs; i++) {
-        s_can_bases[ch]->TXBCR = (1U << i);
-    }
+    uint32_t num_bufs = MCAN_TXBC_NDTB_GET(txbc) + MCAN_TXBC_TFQS_GET(txbc);
+    if (num_bufs > 32U) num_bufs = 32U;
+    s_can_bases[ch]->TXBCR = num_bufs == 32U ? UINT32_MAX : ((1UL << num_bufs) - 1U);
 }
 
 static uint64_t get_time_us(void)
 {
     uint64_t cycles = hpm_csr_get_core_mcycle();
-    if (hpm_core_clock == 0U) {
-        return 0;
-    }
-    return (cycles * 1000000ULL) / hpm_core_clock;
+    return gs_usb_cycles_to_us(cycles, hpm_core_clock);
 }
 
 static void print_tx_pending_diag(uint8_t ch, const char *tag)
@@ -341,11 +345,6 @@ static void handle_can_isr(uint8_t ch)
     uint32_t flags = mcan_get_interrupt_flags(s_can_bases[ch]);
     mcan_clear_interrupt_flags(s_can_bases[ch], flags);
 }
-
-static void ecat_can0_isr(void) { handle_can_isr(0); }
-static void ecat_can1_isr(void) { handle_can_isr(1); }
-static void ecat_can2_isr(void) { handle_can_isr(2); }
-static void ecat_can3_isr(void) { handle_can_isr(3); }
 
 static volatile uint32_t s_canfd_rx_polled[4] = {0, 0, 0, 0};
 
@@ -599,8 +598,19 @@ static UINT8 ecant_config_object_write(UINT16 index,
         return ABORTIDX_VALUE_EXCEEDED;
     }
 
+    /* Configuration changes are only accepted with process outputs stopped. */
+    if (nAlStatus == STATE_OP) {
+        return ABORTIDX_VALUE_EXCEEDED;
+    }
+    ecant_channel_config_shadow_t saved = s_config_shadow[ch];
     *s_config_objs[ch] = candidate;
     if (!sanitize_channel_config((uint8_t)ch, NULL)) {
+        return ABORTIDX_VALUE_EXCEEDED;
+    }
+    if (!apply_can_config((uint8_t)ch)) {
+        s_config_shadow[ch] = saved;
+        sync_shadow_to_config_object((uint8_t)ch);
+        (void)apply_can_config((uint8_t)ch);
         return ABORTIDX_VALUE_EXCEEDED;
     }
 
@@ -773,51 +783,43 @@ static void sanitize_data_control(void)
     sync_shadow_to_data_control_object();
 }
 
-static void apply_can_config(uint8_t ch)
+static bool apply_can_config(uint8_t ch)
 {
+    const ecant_channel_config_shadow_t *cfg = &s_config_shadow[ch];
+    intc_m_disable_irq(s_can_irqs[ch]);
+    mcan_deinit(s_can_bases[ch]);
+    s_can_ready[ch] = false;
+    reset_tx_runtime_state(ch, false, false);
+    s_canfd_rx_head[ch] = s_canfd_rx_tail[ch] = 0U;
+    if (!cfg->enable) {
+        return true;
+    }
     mcan_get_default_config(s_can_bases[ch], &s_can_config);
-    s_can_config.baudrate = 1000000;
-    s_can_config.baudrate_fd = 5000000;
-    s_can_config.enable_canfd = true;
-    s_can_config.enable_tdc = true;
-    s_can_config.tdc_config.ssp_offset = 8;
-    s_can_config.tdc_config.filter_window_length = 4;
+    s_can_config.baudrate = cfg->bitrate_arb;
+    s_can_config.baudrate_fd = cfg->bitrate_data;
+    s_can_config.enable_canfd = cfg->fd_enable != 0U;
+    s_can_config.use_lowlevel_timing_setting = false;
+    s_can_config.enable_tdc = cfg->fd_enable && cfg->bitrate_data > 1000000U;
+    /* Secondary sample point at 75% of a data bit, in source-clock cycles. */
+    uint32_t offset = (uint64_t)s_can_clk_hz[ch] * 3U / ((uint64_t)cfg->bitrate_data * 4U);
+    if (offset > 127U) {
+        return false;
+    }
+    s_can_config.tdc_config.ssp_offset = offset;
+    s_can_config.tdc_config.filter_window_length = 0U;
     s_can_config.mode = mcan_mode_normal;
     s_can_config.disable_auto_retransmission = false;
-    if (s_can_clk_hz[ch] >= 80000000U) {
-        apply_can2_lowlevel_timing_ab(&s_can_config, s_can_clk_hz[ch]);
-    } else {
-        s_can_config.use_lowlevel_timing_setting = true;
-        s_can_config.can_timing.prescaler = 2U;
-        s_can_config.can_timing.num_seg1 = 15U;
-        s_can_config.can_timing.num_seg2 = 4U;
-        s_can_config.can_timing.num_sjw = 4U;
-        s_can_config.can_timing.enable_tdc = false;
-        s_can_config.canfd_timing.prescaler = 1U;
-        s_can_config.canfd_timing.num_seg1 = 5U;
-        s_can_config.canfd_timing.num_seg2 = 2U;
-        s_can_config.canfd_timing.num_sjw = 2U;
-        s_can_config.canfd_timing.enable_tdc = true;
+    mcan_get_default_ram_config(s_can_bases[ch], &s_can_config.ram_config, cfg->fd_enable);
+    hpm_stat_t stat = mcan_init(s_can_bases[ch], &s_can_config, s_can_clk_hz[ch]);
+    s_can_init_status[ch] = stat;
+    if (stat != status_success) {
+        mcan_deinit(s_can_bases[ch]);
+        return false;
     }
-
-    ECANT_LOG("CAN%d Init: Arb=1000000, Data=5000000, FD=1, TDC=1, clk=%lu\n",
-           ch, (unsigned long)s_can_clk_hz[ch]);
-    dump_can_config_summary(ch, &s_can_config, "PRE-INIT");
-
-    mcan_get_default_ram_config(s_can_bases[ch], &s_can_config.ram_config, true);
-    {
-        hpm_stat_t init_stat = mcan_init(s_can_bases[ch], &s_can_config, s_can_clk_hz[ch]);
-        ECANT_LOG("CAN%d mcan_init stat=%ld\n", ch, (long)init_stat);
-    }
-    dump_can_config_regs(ch, "POST-INIT");
-
-    s_can_bases[ch]->CCCR &= ~(uint32_t)(MCAN_CCCR_DAR_MASK);
-
-    reset_tx_runtime_state(ch, false, false);
-
+    s_can_ready[ch] = true;
     mcan_enable_interrupts(s_can_bases[ch], MCAN_EVENT_RECEIVE);
     intc_m_enable_irq_with_priority(s_can_irqs[ch], 1);
-    ECANT_LOG("CAN%d Enabled.\n", ch);
+    return true;
 }
 
 static void check_and_reconfig_can(void)
@@ -909,8 +911,6 @@ static void forward_ecat_to_can(void)
 {
     TOBJ7000 tx_snapshot[4];
 
-    if (s_data_control_shadow.ignore_tx == 1) return;
-
     s_tx_frames[0] = &Can0TxFrame0x7000;
     s_tx_frames[1] = (TOBJ7000*)&Can1TxFrame0x7010;
     s_tx_frames[2] = (TOBJ7000*)&Can2TxFrame0x7020;
@@ -919,8 +919,33 @@ static void forward_ecat_to_can(void)
     for (uint8_t ch = 0; ch < 4; ch++) {
         memcpy(&tx_snapshot[ch], s_tx_frames[ch], sizeof(TOBJ7000));
     }
+    if (nAlStatus != STATE_OP || s_data_control_shadow.ignore_tx) {
+        /* Require a new trigger after entering OP or re-enabling outputs. */
+        for (uint8_t ch = 0; ch < 4; ch++) {
+            s_canfd_tx_trigger_seen[ch] = tx_snapshot[ch].SubIndex005;
+            s_canfd_tx_trigger_observed[ch] = tx_snapshot[ch].SubIndex005;
+            s_canfd_tx_trigger_us[ch] = get_time_us();
+            cancel_all_hw_tx_buffers(ch);
+        }
+        return;
+    }
 
     for (uint8_t ch = 0; ch < 4; ch++) {
+        uint64_t now = get_time_us();
+        uint16_t trigger = tx_snapshot[ch].SubIndex005;
+        if (s_canfd_tx_trigger_observed[ch] != trigger) {
+            s_canfd_tx_trigger_observed[ch] = trigger;
+            s_canfd_tx_trigger_us[ch] = now;
+        }
+        if (trigger != s_canfd_tx_trigger_seen[ch] &&
+            now - s_canfd_tx_trigger_us[ch] >= ECANT_TX_PENDING_TIMEOUT_US) {
+            s_canfd_tx_trigger_seen[ch] = trigger;
+            s_canfd_tx_expired[ch]++;
+        }
+        /* One tracked hardware request per channel; never overwrite its slot. */
+        if (!s_can_ready[ch] || s_canfd_tx_pending[ch] || s_can_bases[ch]->TXBRP) {
+            continue;
+        }
         TOBJ7000 *tx_obj = &tx_snapshot[ch];
         uint16_t current_trig = tx_obj->SubIndex005;
 
@@ -928,13 +953,13 @@ static void forward_ecat_to_can(void)
             continue;
         }
 
-        s_canfd_tx_trigger_seen[ch] = current_trig;
-
         mcan_tx_frame_t tx;
         uint32_t fifo_index = 0;
         memset(&tx, 0, sizeof(tx));
         uint32_t dlc = tx_obj->Dlc;
-        if (dlc == 0 || dlc > 15) continue;
+        if (dlc > 15 || (tx_obj->Flags & ~3U) ||
+            (!(tx_obj->Flags & 1U) && (dlc > 8U || (tx_obj->Flags & 2U))) ||
+            ((tx_obj->Flags & 1U) && !s_config_shadow[ch].fd_enable)) continue;
         tx.use_ext_id = (tx_obj->CanIdHi & 0x2000) ? 1 : 0;
         if (tx.use_ext_id) {
             tx.ext_id = ((uint32_t)(tx_obj->CanIdHi & 0x1FFF) << 16) | tx_obj->CanIdLo;
@@ -966,6 +991,7 @@ static void forward_ecat_to_can(void)
         ECANT_LOG("ECAT -> CAN%d: ID=0x%lx, Stat=%ld\n", ch, (uint32_t)(tx.use_ext_id ? tx.ext_id : tx.std_id), (long)stat);
 
         if (stat == status_success) {
+            s_canfd_tx_trigger_seen[ch] = current_trig;
             s_canfd_tx_pending[ch] = true;
             s_canfd_tx_fifo_idx[ch] = fifo_index;
             s_canfd_tx_id[ch] = (uint32_t)(tx.use_ext_id ? tx.ext_id : tx.std_id);
@@ -1058,16 +1084,11 @@ void ecat_run(void)
 
     MainInit();
     
-    install_isr(BOARD_CAN0_IRQn, (uint32_t)ecat_can0_isr);
-    install_isr(BOARD_CAN1_IRQn, (uint32_t)ecat_can1_isr);
-    install_isr(BOARD_CAN2_IRQn, (uint32_t)ecat_can2_isr);
-    install_isr(BOARD_CAN3_IRQn, (uint32_t)ecat_can3_isr);
+    can_irq_set_handler(handle_can_isr);
     ecant_canfd_init();
     
     APPL_GenerateMapping(&nPdInputSize, &nPdOutputSize);
     bRunApplication = TRUE;
-
-    EcatWdValue = 0;
 
     uint16_t last_status = 0;
     while (bRunApplication) {
@@ -1079,8 +1100,20 @@ void ecat_run(void)
             PDO_InputMapping();
         }
         MainLoop();
-        EcatWdValue = 0;
-        forward_ecat_to_can();
+        /* Process AL transitions before allowing any new CAN output. */
+        if (nAlStatus != last_status) {
+            for (uint8_t ch = 0; ch < 4; ch++) {
+                cancel_all_hw_tx_buffers(ch);
+            }
+            /* Snapshot the current PDO without submitting it on this cycle. */
+            uint8_t saved_ignore = s_data_control_shadow.ignore_tx;
+            s_data_control_shadow.ignore_tx = 1U;
+            forward_ecat_to_can();
+            s_data_control_shadow.ignore_tx = saved_ignore;
+            last_status = nAlStatus;
+        } else {
+            forward_ecat_to_can();
+        }
         sync_can_status_to_sdo();
 
         for (uint8_t lch = 0; lch < 4; lch++) {
@@ -1119,19 +1152,5 @@ void ecat_run(void)
             s_ecat_usb_led_tick = 0;
         }
 
-        if (nAlStatus != last_status) {
-            if (last_status == STATE_OP && nAlStatus != STATE_OP) {
-                for (uint8_t ch = 0; ch < 4; ch++) cancel_all_hw_tx_buffers(ch);
-                reset_all_tx_runtime_state(false, true);
-            } else if (nAlStatus == STATE_OP && last_status != STATE_OP) {
-                for (uint8_t ch = 0; ch < 4; ch++) {
-                    cancel_all_hw_tx_buffers(ch);
-                    s_canfd_rx_head[ch] = s_canfd_rx_tail[ch];
-                }
-                HW_EscWriteDWord(0, ESC_PD_WD_TIME);
-            }
-            ECANT_LOG("AL Status: 0x%02x rx=%lu\n", nAlStatus, (unsigned long)s_canfd_rx_polled[0]);
-            last_status = nAlStatus;
-        }
     }
 }

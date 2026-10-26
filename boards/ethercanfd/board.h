@@ -120,7 +120,8 @@
 #define BOARD_CONSOLE_UART_RX_DMA_REQ HPM_DMA_SRC_UART11_RX
 #endif
 #endif
-#define BOARD_CONSOLE_UART_BAUDRATE (921600UL)
+/* High-rate diagnostic console; host terminal must use 1500000 8N1. */
+#define BOARD_CONSOLE_UART_BAUDRATE (1500000UL)
 #endif
 #endif
 
