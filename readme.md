@@ -20,7 +20,7 @@ CAN FD 控制器经 USB 高速接口暴露给主机，协议为社区通用的 *
 | 序列号 | `202604070001` |
 | 端点 | EP1 IN（`0x81`）/ EP2 OUT（`0x02`），512 字节包 |
 | CAN 通道 | 4 路独立 CAN FD |
-| 固件版本 | 1.1.0 |
+| 固件版本 | 1.2.0 |
 
 ---
 
@@ -148,7 +148,7 @@ AXI_SRAM_NONCACHEABLE:   14344 B        64 KB     21.89%
 | 文件 | 大小 | 说明 |
 |---|---|---|
 | `ethercanfd.bin` | 116256 B | **烧录用**，已含 HPM 引导头 |
-| `ethercanfd_v1.1.0-<日期>.bin` | 116256 B | 带版本号的副本 |
+| `ethercanfd_v1.2.0-<日期>.bin` | 116256 B | 带版本号的副本 |
 | `ethercanfd.elf` | — | 调试用可执行文件 |
 | `ethercanfd.map` | — | 内存与符号分布 |
 | `ethercanfd.asm` | — | 反汇编 |
