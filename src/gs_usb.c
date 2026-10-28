@@ -13,6 +13,8 @@
 #include "hpm_csr_drv.h"
 #include "hpm_sysctl_drv.h"
 #include "hpm_mcan_drv.h"
+#include "hpm_otp_drv.h"
+#include "hpm_otp_table.h"
 #include "version.h"
 #include "hpm_clock_drv.h"
 #include "hpm_ewdg_drv.h"
@@ -272,7 +274,7 @@ USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) uint8_t
 USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_langid[] = { 0x09, 0x04 };
 USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_manufacturer[] = "wentywenty";
 USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_product[] = "roboto_usb4can v" FIRMWARE_VERSION;
-USB_NOCACHE_RAM_INIT_SECTION USB_MEM_ALIGNX __attribute__((aligned(32))) char gs_usb_string_serial[] = "202604070001";
+static char gs_usb_string_serial[33];
 
 static const char *gs_usb_string_descriptors[] = {
     gs_usb_string_langid,
@@ -322,6 +324,32 @@ static const char *gs_usb_string_descriptor_callback(uint8_t speed, uint8_t inde
         return NULL;
     }
     return (const char *)gs_usb_string_descriptors[index];
+}
+
+static void gs_usb_build_serial(void)
+{
+    uint32_t uid[4];
+    const uint8_t *bytes = (const uint8_t *)uid;
+    bool valid = false;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        uid[i] = otp_read_from_shadow(OTP_TABLE_DIE_TRACE_OFFSET + i);
+        valid = valid || (uid[i] != 0U);
+    }
+    if (!valid) {
+        for (i = 0; i < 4; i++) {
+            uid[i] = otp_read_from_shadow(OTP_TABLE_UUID_OFFSET + i);
+            valid = valid || (uid[i] != 0U);
+        }
+    }
+    if (!valid) {
+        snprintf(gs_usb_string_serial, sizeof(gs_usb_string_serial), "%s", "202604070001");
+        return;
+    }
+    for (i = 0; i < 16; i++) {
+        snprintf(&gs_usb_string_serial[i * 2], 3, "%02x", bytes[i]);
+    }
 }
 
 #define TX_RING_SIZE_PER_CH      128U
@@ -2027,6 +2055,8 @@ struct usbd_interface gs_usb_interface;
 
 void gs_usb_init(void)
 {
+    gs_usb_build_serial();
+    printf("[GS_USB] serial: %s\r\n", gs_usb_string_serial);
     usbd_desc_register(0, &gs_usb_descriptors);
 
     gs_usb_interface.class_interface_handler = NULL;
